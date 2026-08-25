@@ -58,8 +58,11 @@ impl Widget for DiffPane<'_> {
             };
             let cell = row.cells[self.side.idx()];
             let mut style = self.theme.row_style(row.kind, cell, side_is_left);
-            if row_index == self.cursor && self.focused {
-                style = style.underlined();
+            // Not gated on `focused`: both panes render the same row index, so the cursor
+            // belongs on both. Which side has focus is shown by the gutter instead.
+            let on_cursor = row_index == self.cursor;
+            if on_cursor {
+                style = self.theme.cursor(style);
             }
 
             // Paint the whole row first so the background reaches the pane edge.
@@ -104,7 +107,14 @@ impl Widget for DiffPane<'_> {
                         self.tab_width,
                         style,
                         &emph,
-                        style.patch(self.theme.emph_style(side_is_left)),
+                        {
+                            let emph = style.patch(self.theme.emph_style(side_is_left));
+                            if on_cursor {
+                                self.theme.cursor(emph)
+                            } else {
+                                emph
+                            }
+                        },
                     );
                 }
             }

@@ -4,8 +4,16 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::model::{Cell, RowKind};
 
+/// Background of the selected row when the row has no colour of its own.
+const CURSOR_BG: Color = Color::Rgb(52, 52, 64);
+
+/// How much to lift a row background to mark it as selected.
+const CURSOR_LIFT: u8 = 38;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
+    /// No colours available, so the cursor has to be drawn with an attribute instead.
+    pub monochrome: bool,
     pub equal: Style,
     pub changed: Style,
     pub added: Style,
@@ -25,6 +33,7 @@ pub struct Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
+            monochrome: false,
             equal: Style::new(),
             changed: Style::new().bg(Color::Rgb(30, 40, 60)),
             added: Style::new().bg(Color::Rgb(20, 55, 30)),
@@ -47,6 +56,7 @@ impl Theme {
     pub fn no_color() -> Self {
         let plain = Style::new();
         Self {
+            monochrome: true,
             equal: plain,
             changed: plain,
             added: plain,
@@ -90,11 +100,88 @@ impl Theme {
         }
     }
 
+    /// The selected row, keeping whatever the row already meant.
+    ///
+    /// Deliberately not `REVERSED`: swapping foreground and background on a row that is
+    /// already green or red destroys the very signal the colour carries. Lifting the
+    /// row's own background keeps "this line was added" readable while still marking the
+    /// cursor across the full width.
+    pub fn cursor(&self, base: Style) -> Style {
+        if self.monochrome {
+            return base.add_modifier(Modifier::REVERSED);
+        }
+        let bg = match base.bg {
+            Some(Color::Rgb(r, g, b)) => Color::Rgb(
+                r.saturating_add(CURSOR_LIFT),
+                g.saturating_add(CURSOR_LIFT),
+                b.saturating_add(CURSOR_LIFT),
+            ),
+            // An unstyled row (an equal line) has no hue to preserve.
+            _ => CURSOR_BG,
+        };
+        base.bg(bg)
+    }
+
     pub fn emph_style(&self, side_is_left: bool) -> Style {
         if side_is_left {
             self.emph_removed
         } else {
             self.emph_added
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Cell, LineNo, RowKind};
+
+    #[test]
+    fn the_cursor_lifts_a_row_background_without_changing_its_hue() {
+        let theme = Theme::dark();
+        let added = theme.row_style(RowKind::Unmatched, Cell::Line(LineNo(0)), false);
+        let selected = theme.cursor(added);
+
+        let (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) = (added.bg, selected.bg)
+        else {
+            panic!("both should carry an rgb background");
+        };
+        // Brighter on every channel...
+        assert!(r1 > r0 && g1 > g0 && b1 > b0);
+        // ...and still recognisably green, which is the whole point of not using REVERSED:
+        // a selected added line must still read as added.
+        assert!(g1 > r1 && g1 > b1, "selected added row lost its hue");
+    }
+
+    #[test]
+    fn added_and_removed_stay_distinguishable_under_the_cursor() {
+        let theme = Theme::dark();
+        let added = theme.cursor(theme.row_style(RowKind::Unmatched, Cell::Line(LineNo(0)), false));
+        let removed =
+            theme.cursor(theme.row_style(RowKind::Unmatched, Cell::Line(LineNo(0)), true));
+        assert_ne!(added.bg, removed.bg);
+    }
+
+    #[test]
+    fn an_equal_row_gets_a_neutral_cursor_background() {
+        let theme = Theme::dark();
+        let equal = theme.row_style(RowKind::Equal, Cell::Line(LineNo(0)), true);
+        assert_eq!(equal.bg, None, "an equal row has no background of its own");
+        assert_eq!(theme.cursor(equal).bg, Some(CURSOR_BG));
+    }
+
+    #[test]
+    fn the_monochrome_theme_falls_back_to_reverse_video() {
+        let theme = Theme::no_color();
+        let selected = theme.cursor(theme.equal);
+        assert!(selected.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(selected.bg, None, "no colour means no background to lift");
+    }
+
+    #[test]
+    fn lifting_saturates_rather_than_wrapping() {
+        let theme = Theme::dark();
+        let bright = Style::new().bg(Color::Rgb(250, 250, 250));
+        assert_eq!(theme.cursor(bright).bg, Some(Color::Rgb(255, 255, 255)));
     }
 }

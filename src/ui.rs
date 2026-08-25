@@ -183,7 +183,7 @@ fn draw_dir_pane(
             theme.filler
         };
         if offset == cursor {
-            style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+            style = theme.cursor(style);
         }
         lines.push(Line::from(Span::styled(text, style)));
     }
@@ -211,7 +211,7 @@ fn draw_dir_markers(
     {
         let mut style = theme.marker;
         if offset == cursor {
-            style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+            style = theme.cursor(style);
         }
         lines.push(Line::from(Span::styled(
             format!(" {} ", view.rows[row_index].status.glyph()),
@@ -426,7 +426,12 @@ fn draw_markers(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Them
                 }
             }
         };
-        lines.push(Line::from(Span::styled(format!(" {glyph} "), theme.marker)));
+        let style = if view.top + dy as usize == view.cursor {
+            theme.cursor(theme.marker)
+        } else {
+            theme.marker
+        };
+        lines.push(Line::from(Span::styled(format!(" {glyph} "), style)));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -953,5 +958,135 @@ mod dir_render_tests {
         let joined = frame(&mut app, 60, 18).join("\n");
         assert!(joined.contains("switch focused side"), "{joined}");
         assert!(!joined.contains("cycle filter"), "{joined}");
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use crate::app::{App, Options, View};
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{FileContent, decode};
+    use crate::theme::Theme;
+    use crate::{Inputs, app};
+
+    fn content(name: &str, body: &str) -> FileContent {
+        FileContent::Text(Box::new(decode(
+            std::path::Path::new(name),
+            body.as_bytes().to_vec(),
+            None,
+        )))
+    }
+
+    /// A file view on the real (coloured) theme, so cursor styling is observable.
+    fn file_app(left: &str, right: &str) -> App {
+        let opts = Options {
+            diff: DiffOptions::default(),
+            tab_width: 8,
+            max_file_size: u64::MAX,
+            follow_symlinks: false,
+        };
+        let cmp = compare_loaded(content("a", left), content("b", right), &opts.diff);
+        let mut app = App::new(
+            Inputs::Dirs {
+                left: std::env::temp_dir(),
+                right: std::env::temp_dir(),
+            },
+            opts,
+            Theme::dark(),
+        )
+        .expect("temp dir exists");
+        app.views = vec![View::File(Box::new(app::FileView::new(cmp)))];
+        app
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| super::draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_backgrounds(buf: &Buffer, y: u16, width: u16) -> Vec<Option<ratatui::style::Color>> {
+        (0..width)
+            .map(|x| buf.cell((x, y)).unwrap().style().bg)
+            .collect()
+    }
+
+    #[test]
+    fn the_selected_row_is_highlighted_across_the_full_width() {
+        let mut app = file_app("one\ntwo\nthree\n", "one\ntwo\nthree\n");
+        let buf = render(&mut app, 40, 6);
+
+        // Body starts at y=1. The cursor sits on the first row.
+        let selected = row_backgrounds(&buf, 1, 40);
+        let plain = row_backgrounds(&buf, 2, 40);
+
+        assert!(
+            selected.iter().all(|bg| *bg == selected[0]),
+            "the highlight must be uniform across the row, including the gutters and the \
+             marker column: {selected:?}"
+        );
+        assert_ne!(
+            selected[0], plain[0],
+            "the selected row must differ from an unselected one"
+        );
+        assert!(selected[0].is_some(), "the selected row needs a background");
+    }
+
+    #[test]
+    fn the_highlight_covers_both_panes_and_the_marker_column() {
+        let mut app = file_app("one\ntwo\n", "one\ntwo\n");
+        let buf = render(&mut app, 40, 5);
+        let selected = row_backgrounds(&buf, 1, 40);
+
+        // Left pane, marker column and right pane all carry it -- the cursor is a property
+        // of the row, not of whichever pane happens to have focus.
+        let left = selected[2];
+        let marker = selected[20];
+        let right = selected[37];
+        assert_eq!(left, marker);
+        assert_eq!(marker, right);
+    }
+
+    #[test]
+    fn moving_the_cursor_moves_the_highlight() {
+        let mut app = file_app("one\ntwo\nthree\n", "one\ntwo\nthree\n");
+        let before = render(&mut app, 40, 6);
+        let first_row_bg = before.cell((2, 1)).unwrap().style().bg;
+
+        app.active_file().unwrap().cursor = 1;
+        let after = render(&mut app, 40, 6);
+
+        assert_ne!(
+            after.cell((2, 1)).unwrap().style().bg,
+            first_row_bg,
+            "row 1 should no longer be highlighted"
+        );
+        assert_eq!(
+            after.cell((2, 2)).unwrap().style().bg,
+            first_row_bg,
+            "row 2 should now carry the highlight"
+        );
+    }
+
+    #[test]
+    fn a_changed_row_keeps_its_colour_when_selected() {
+        // The reason the cursor lifts the background instead of reversing it: a selected
+        // changed line must still look changed.
+        let mut app = file_app("same\nold\n", "same\nnew\n");
+        let mut buf = render(&mut app, 40, 5);
+        let equal_selected = buf.cell((2, 1)).unwrap().style().bg;
+
+        app.active_file().unwrap().cursor = 1;
+        buf = render(&mut app, 40, 5);
+        let changed_selected = buf.cell((2, 2)).unwrap().style().bg;
+
+        assert_ne!(
+            equal_selected, changed_selected,
+            "a selected changed row must not look like a selected equal row"
+        );
     }
 }
