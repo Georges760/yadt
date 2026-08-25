@@ -726,6 +726,7 @@ mod tests {
             rel: PathBuf::from(rel),
             depth,
             kind,
+            kinds: [Some(kind), Some(kind), None],
             present: [true, true, false],
             status,
             sizes: [None; crate::model::MAX_SIDES],

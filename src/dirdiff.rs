@@ -101,7 +101,12 @@ impl EntryStatus {
 pub struct DirEntryRow {
     pub rel: PathBuf,
     pub depth: u16,
+    /// What this entry is for tree purposes: `Dir` only when both sides agree it is one,
+    /// so a type mismatch is never expandable.
     pub kind: EntryKind,
+    /// What each side actually holds. A type mismatch is a directory on one side and a
+    /// file on the other, and each pane has to say so.
+    pub kinds: [Option<EntryKind>; MAX_SIDES],
     /// Which sides hold this name. `present` is the truth; `status` is the summary.
     pub present: [bool; MAX_SIDES],
     pub status: EntryStatus,
@@ -109,6 +114,11 @@ pub struct DirEntryRow {
 }
 
 impl DirEntryRow {
+    /// What `side` holds here, if anything.
+    pub fn kind_on(&self, side: SideIdx) -> Option<EntryKind> {
+        self.kinds[side.idx()]
+    }
+
     pub fn name(&self) -> String {
         self.rel.file_name().map_or_else(
             || self.rel.display().to_string(),
@@ -267,6 +277,7 @@ pub fn merge(
         let child = rel.join(entry.name.clone());
 
         let present = [left.is_some(), right.is_some(), false];
+        let kinds = [left.map(|e| e.kind), right.map(|e| e.kind), None];
         let sizes = [left.map(|e| e.size), right.map(|e| e.size), None];
 
         let (kind, status) = match (left, right) {
@@ -274,7 +285,9 @@ pub fn merge(
             // node_modules/ must not cost 50k stats to tell you it is missing.
             (Some(e), None) => (e.kind, EntryStatus::OnlyIn(SideIdx::LEFT)),
             (None, Some(e)) => (e.kind, EntryStatus::OnlyIn(SideIdx::RIGHT)),
-            (Some(l), Some(r)) if l.kind != r.kind => (l.kind, EntryStatus::TypeMismatch),
+            // Not `l.kind`: the sides disagree, so there is no single kind, and calling it a
+            // directory would make it expandable with nothing beneath it.
+            (Some(l), Some(r)) if l.kind != r.kind => (EntryKind::Other, EntryStatus::TypeMismatch),
             (Some(l), Some(_)) => match l.kind {
                 EntryKind::Dir => (EntryKind::Dir, EntryStatus::Pending),
                 EntryKind::File => (
@@ -305,6 +318,7 @@ pub fn merge(
             rel: child.clone(),
             depth,
             kind,
+            kinds,
             present,
             status,
             sizes,

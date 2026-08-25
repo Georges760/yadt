@@ -5,10 +5,12 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, DirView, FileView, View};
 use crate::diff::human_size;
-use crate::dirdiff::EntryStatus;
+use crate::dirdiff::{EntryKind, EntryStatus};
 use crate::model::{Cell, RowKind, SideIdx};
 use crate::pane::DiffPane;
 use crate::text::{FileContent, TextFile};
@@ -92,6 +94,51 @@ fn draw_dir_body(frame: &mut Frame<'_>, area: Rect, view: &mut DirView, theme: &
         return;
     }
 
+    // Same three-column split as the file view: each side renders its own tree, aligned
+    // row by row, with the marker column between. A name missing on one side leaves that
+    // pane blank, so reading down one column tells you what that tree actually contains.
+    let [left, marker, right] = pane_columns(area);
+    draw_dir_pane(
+        frame,
+        left,
+        view,
+        &visible,
+        top,
+        cursor,
+        SideIdx::LEFT,
+        theme,
+    );
+    draw_dir_pane(
+        frame,
+        right,
+        view,
+        &visible,
+        top,
+        cursor,
+        SideIdx::RIGHT,
+        theme,
+    );
+    draw_dir_markers(frame, marker, view, &visible, top, cursor, theme);
+}
+
+/// One side of the directory tree.
+///
+/// Rows a side does not hold render as blank filler, which is what keeps the two panes
+/// aligned: row `i` is the same entry in both, exactly as in the file view.
+#[allow(clippy::too_many_arguments)]
+fn draw_dir_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &DirView,
+    visible: &[usize],
+    top: usize,
+    cursor: usize,
+    side: SideIdx,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let width = area.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
 
@@ -102,37 +149,106 @@ fn draw_dir_body(frame: &mut Frame<'_>, area: Rect, view: &mut DirView, theme: &
         .take(area.height as usize)
     {
         let row = &view.rows[row_index];
-        let indent = "  ".repeat(row.depth as usize);
-        let marker = if row.kind.is_dir() {
-            if view.is_collapsed(&row.rel) {
-                "\u{25b8} " // ▸ collapsed
+        let present = row.present[side.idx()];
+
+        let side_kind = row.kind_on(side);
+        let side_is_dir = side_kind == Some(EntryKind::Dir);
+
+        let text = if present {
+            let indent = "  ".repeat(row.depth as usize);
+            // Only a row both sides agree is a directory can be folded, so the marker
+            // follows `row.kind` while the trailing slash follows what this side holds.
+            let fold = if row.kind.is_dir() {
+                if view.is_collapsed(&row.rel) {
+                    "\u{25b8} " // ▸ collapsed
+                } else {
+                    "\u{25be} " // ▾ expanded
+                }
             } else {
-                "\u{25be} " // ▾ expanded
-            }
+                "  "
+            };
+            let name = format!("{}{}", row.name(), if side_is_dir { "/" } else { "" });
+            let size = match (side_kind, row.sizes[side.idx()]) {
+                (Some(EntryKind::File), Some(bytes)) => human_size(bytes),
+                _ => String::new(),
+            };
+            pad_row(&format!(" {indent}{fold}{name}"), &size, width)
         } else {
-            "  "
+            " ".repeat(width)
         };
-        let name = format!("{}{}", row.name(), if row.kind.is_dir() { "/" } else { "" });
-        let detail = row.status.describe();
 
-        // Pad to the full width so the row background reaches the pane edge.
-        let left = format!(" {} {indent}{marker}{name}", row.status.glyph());
-        let pad = width
-            .saturating_sub(left.chars().count())
-            .saturating_sub(detail.chars().count() + 1);
-        let text = format!("{left}{}{detail} ", " ".repeat(pad));
+        let mut style = if present {
+            status_style(row.status, theme)
+        } else {
+            theme.filler
+        };
+        if offset == cursor {
+            style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+        }
+        lines.push(Line::from(Span::styled(text, style)));
+    }
 
-        let mut style = status_style(row.status, theme);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The column between the panes. With colour off this carries the entire diff.
+#[allow(clippy::too_many_arguments)]
+fn draw_dir_markers(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &DirView,
+    visible: &[usize],
+    top: usize,
+    cursor: usize,
+    theme: &Theme,
+) {
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    for (offset, &row_index) in visible
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(area.height as usize)
+    {
+        let mut style = theme.marker;
         if offset == cursor {
             style = style.add_modifier(ratatui::style::Modifier::REVERSED);
         }
         lines.push(Line::from(Span::styled(
-            truncate_right(&text, width),
+            format!(" {} ", view.rows[row_index].status.glyph()),
             style,
         )));
     }
-
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Lay `left` and `right` across `width` display columns with `right` flush to the end,
+/// padding the gap so the row background reaches the pane edge.
+///
+/// Measured in display columns, not chars: a CJK filename is twice as wide as its char
+/// count and would otherwise push the size column out of alignment.
+fn pad_row(left: &str, right: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let right_width = UnicodeWidthStr::width(right);
+    let left = truncate_to_width(left, width.saturating_sub(right_width + 1));
+    let gap = width.saturating_sub(UnicodeWidthStr::width(left.as_str()) + right_width + 1);
+    format!("{left}{}{right} ", " ".repeat(gap))
+}
+
+/// Cut a string to at most `width` display columns, never splitting a grapheme.
+fn truncate_to_width(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
+        if used + w > width {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
+    out
 }
 
 fn status_style(status: EntryStatus, theme: &Theme) -> Style {
@@ -144,13 +260,6 @@ fn status_style(status: EntryStatus, theme: &Theme) -> Style {
         EntryStatus::TypeMismatch | EntryStatus::Unreadable(_) => theme.warning,
         EntryStatus::Pending => theme.filler,
     }
-}
-
-fn truncate_right(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    s.chars().take(width).collect()
 }
 
 fn draw_dir_status(
@@ -626,18 +735,31 @@ mod dir_render_tests {
     use crate::app::{App, DirFilter, Options};
     use crate::diff::DiffOptions;
     use crate::dirdiff::{DirEntryRow, EntryKind, EntryStatus, ScanEvent};
-    use crate::model::{MAX_SIDES, SideIdx};
+    use crate::model::SideIdx;
     use crate::theme::Theme;
     use crate::{Inputs, app};
 
+    /// `present` is derived from the status, exactly as the scanner does it -- a fixture
+    /// that claims both sides hold a one-sided entry would hide a real rendering bug.
     fn row(rel: &str, depth: u16, kind: EntryKind, status: EntryStatus) -> DirEntryRow {
+        let present = match status {
+            EntryStatus::OnlyIn(SideIdx::LEFT) => [true, false, false],
+            EntryStatus::OnlyIn(_) => [false, true, false],
+            _ => [true, true, false],
+        };
+        let size = matches!(kind, EntryKind::File).then_some(2048);
         DirEntryRow {
             rel: std::path::PathBuf::from(rel),
             depth,
             kind,
-            present: [true, true, false],
+            kinds: [present[0].then_some(kind), present[1].then_some(kind), None],
+            present,
             status,
-            sizes: [None; MAX_SIDES],
+            sizes: [
+                present[0].then_some(size).flatten(),
+                present[1].then_some(size).flatten(),
+                None,
+            ],
         }
     }
 
@@ -704,28 +826,30 @@ mod dir_render_tests {
     #[test]
     fn the_tree_shows_status_glyphs_indentation_and_fold_markers() {
         let mut app = dir_app(sample());
-        let lines = frame(&mut app, 46, 8);
+        let lines = frame(&mut app, 66, 8);
 
-        // Row 0 is the header. Each entry is "<glyph> <indent><fold> <name>" with the
-        // status right-aligned against the pane edge.
-        assert_eq!(lines[1], "     same.txt                       identical");
+        // Row 0 is the header (both roots). Each side renders its own tree with its own
+        // size column, and the marker column sits between them.
+        assert_eq!(
+            lines[1],
+            "   same.txt             2.0 KiB       same.txt            2.0 KiB"
+        );
         assert_eq!(
             lines[2],
-            " \u{25ac}   changed.txt                      differs"
+            "   changed.txt          2.0 KiB  \u{25ac}    changed.txt         2.0 KiB"
         );
-        assert_eq!(
-            lines[3],
-            " \u{25c0}   gone.txt                only on the left"
-        );
-        // A directory carries a fold marker and a trailing slash.
+        // Only on the left: the right pane is blank, which is the whole point of the
+        // mirrored layout — reading down one column shows what that tree holds.
+        assert_eq!(lines[3], "   gone.txt             2.0 KiB  \u{25c0}");
+        // A directory carries a fold marker and a trailing slash, and no size.
         assert_eq!(
             lines[4],
-            " \u{25ac} \u{25be} sub/                             differs"
+            " \u{25be} sub/                          \u{25ac}  \u{25be} sub/"
         );
-        // Its child is indented one level deeper.
+        // Its child is indented one level deeper on both sides.
         assert_eq!(
             lines[5],
-            " \u{25ac}     b.txt                          differs"
+            "     b.txt              2.0 KiB  \u{25ac}      b.txt             2.0 KiB"
         );
     }
 
@@ -735,13 +859,33 @@ mod dir_render_tests {
         let dir = app.active_dir().unwrap();
         dir.collapse_for_test(std::path::Path::new("sub"));
 
-        let lines = frame(&mut app, 46, 8);
+        let lines = frame(&mut app, 66, 8);
+        // The fold marker flips to ▸ on both sides.
         assert_eq!(
             lines[4],
-            " \u{25ac} \u{25b8} sub/                             differs"
+            " \u{25b8} sub/                          \u{25ac}  \u{25b8} sub/"
         );
         // b.txt is gone; row 5 is blank.
         assert_eq!(lines[5], "");
+    }
+
+    #[test]
+    fn a_type_mismatch_shows_each_side_as_what_it_actually_is() {
+        // A directory on the left facing a regular file on the right. Rendering both as
+        // directories would be a lie, and would make the row look expandable.
+        let mut rows = vec![row("clash", 0, EntryKind::Other, EntryStatus::TypeMismatch)];
+        rows[0].kinds = [Some(EntryKind::Dir), Some(EntryKind::File), None];
+        rows[0].sizes = [None, Some(2048), None];
+
+        let mut app = dir_app(rows);
+        let lines = frame(&mut app, 66, 4);
+
+        // Left: a trailing slash and no size. Right: no slash, and its size.
+        // Neither side gets a fold marker, because the row is not expandable.
+        assert_eq!(
+            lines[1],
+            "   clash/                        \u{2260}    clash               2.0 KiB"
+        );
     }
 
     #[test]
