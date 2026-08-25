@@ -257,7 +257,9 @@ fn status_style(status: EntryStatus, theme: &Theme) -> Style {
         EntryStatus::Differing => theme.changed,
         EntryStatus::OnlyIn(SideIdx::LEFT) => theme.removed,
         EntryStatus::OnlyIn(_) => theme.added,
-        EntryStatus::TypeMismatch | EntryStatus::Unreadable(_) => theme.warning,
+        EntryStatus::TypeMismatch | EntryStatus::Cycle | EntryStatus::Unreadable(_) => {
+            theme.warning
+        }
         EntryStatus::Pending => theme.filler,
     }
 }

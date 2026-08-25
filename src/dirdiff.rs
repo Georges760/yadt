@@ -11,7 +11,7 @@
 //! the walk itself but the content comparison: any pair of equal-sized differing files is
 //! read in full, so a synchronous scan would freeze the event loop with no way to press `q`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,9 @@ pub enum EntryStatus {
     OnlyIn(SideIdx),
     /// The two sides disagree about what this name *is*.
     TypeMismatch,
+    /// Following symlinks led back to a directory already on the path. Reported rather
+    /// than walked, so a cycle cannot spin the scan.
+    Cycle,
     Unreadable(io::ErrorKind),
 }
 
@@ -79,6 +82,7 @@ impl EntryStatus {
             Self::OnlyIn(SideIdx::LEFT) => "\u{25c0}", // ◀
             Self::OnlyIn(_) => "\u{25b6}",             // ▶
             Self::TypeMismatch => "\u{2260}",          // ≠
+            Self::Cycle => "\u{21bb}",                 // ↻
             Self::Unreadable(_) => "?",
         }
     }
@@ -91,6 +95,7 @@ impl EntryStatus {
             Self::OnlyIn(SideIdx::LEFT) => "only on the left".to_string(),
             Self::OnlyIn(_) => "only on the right".to_string(),
             Self::TypeMismatch => "different kinds".to_string(),
+            Self::Cycle => "symlink cycle".to_string(),
             Self::Unreadable(kind) => format!("unreadable: {kind:?}"),
         }
     }
@@ -151,12 +156,23 @@ pub enum ScanEvent {
     },
 }
 
+/// A stable identity for a directory, used to break symlink cycles.
+pub type DirId = (u64, u64);
+
 /// Where a scan reads its entries from.
 ///
 /// Exists so the merge can be tested without touching a filesystem: production uses
 /// [`FsSource`], tests use an in-memory fake. Cheaper and more precise than fixture
 /// directories.
 pub trait DirSource: Send + Sync {
+    /// Identity of the directory at `rel`, when the source can cheaply provide one.
+    ///
+    /// `None` means "cycles are impossible here", which is the case whenever symlinks are
+    /// not followed -- the walk can then only descend real directories.
+    fn dir_id(&self, _side: SideIdx, _rel: &Path) -> Option<DirId> {
+        None
+    }
+
     /// Entries directly under `rel` on `side`.
     fn list(&self, side: SideIdx, rel: &Path) -> io::Result<Vec<DirEntry>>;
     /// Are the regular files at `rel` byte-identical on both sides?
@@ -187,6 +203,24 @@ impl FsSource {
 }
 
 impl DirSource for FsSource {
+    fn dir_id(&self, side: SideIdx, rel: &Path) -> Option<DirId> {
+        // Without following, the walk only descends real directories, so no cycle exists
+        // and the stat is wasted work.
+        if !self.follow_symlinks {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(self.path(side, rel)).ok()?;
+            Some((meta.dev(), meta.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     fn list(&self, side: SideIdx, rel: &Path) -> io::Result<Vec<DirEntry>> {
         let dir = self.path(side, rel);
         let mut out = Vec::new();
@@ -232,17 +266,47 @@ impl DirSource for FsSource {
 ///
 /// Returns true when everything at or below `rel` is identical, which is how a directory
 /// gets its rolled-up status.
+///
+/// `visited` holds the directory identities on the *current path*. Entries are removed on
+/// the way back up, so this detects a true ancestor cycle without mistaking two symlinks
+/// pointing at the same sibling directory for one.
 pub fn merge(
     source: &dyn DirSource,
     rel: &Path,
     depth: u16,
     cancel: &AtomicBool,
+    visited: &mut HashSet<DirId>,
     out: &mut dyn FnMut(ScanEvent),
 ) -> bool {
     if cancel.load(Ordering::Relaxed) {
         return true;
     }
 
+    // Each level marks *itself* as being on the path, so callers can pass an empty set and
+    // the guard still holds from the root down. Doing this at the recursion site instead
+    // would leave the root unmarked, and a link straight back to it would be missed.
+    let own: Vec<DirId> = [SideIdx::LEFT, SideIdx::RIGHT]
+        .into_iter()
+        .filter_map(|side| source.dir_id(side, rel))
+        .collect();
+    for id in &own {
+        visited.insert(*id);
+    }
+    let all_identical = merge_level(source, rel, depth, cancel, visited, out);
+    for id in &own {
+        visited.remove(id);
+    }
+    all_identical
+}
+
+fn merge_level(
+    source: &dyn DirSource,
+    rel: &Path,
+    depth: u16,
+    cancel: &AtomicBool,
+    visited: &mut HashSet<DirId>,
+    out: &mut dyn FnMut(ScanEvent),
+) -> bool {
     // Collect both sides into sorted maps, then walk their union once. BTreeMap keyed by
     // the raw bytes gives a deterministic order that does not depend on locale.
     let mut sides: [BTreeMap<Vec<u8>, DirEntry>; 2] = [BTreeMap::new(), BTreeMap::new()];
@@ -314,6 +378,25 @@ pub fn merge(
             (None, None) => unreachable!("name came from one of the maps"),
         };
 
+        // A directory we would descend into, but which is already on the path, is a cycle:
+        // report it and stop, rather than following a symlink back up the tree.
+        let ids: Vec<DirId> = if status == EntryStatus::Pending {
+            [SideIdx::LEFT, SideIdx::RIGHT]
+                .into_iter()
+                .filter_map(|side| source.dir_id(side, &child))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let is_cycle = ids.iter().any(|id| visited.contains(id));
+        // A cycle has no children to show, so it must not render as expandable. `kinds`
+        // still says Dir on both sides, so each pane keeps its trailing slash.
+        let (kind, status) = if is_cycle {
+            (EntryKind::Other, EntryStatus::Cycle)
+        } else {
+            (kind, status)
+        };
+
         out(ScanEvent::Entry(Box::new(DirEntryRow {
             rel: child.clone(),
             depth,
@@ -331,7 +414,7 @@ pub fn merge(
         // Recurse into directories present on both sides, then tell the UI what the
         // subtree turned out to be.
         if status == EntryStatus::Pending {
-            let subtree_identical = merge(source, &child, depth + 1, cancel, out);
+            let subtree_identical = merge(source, &child, depth + 1, cancel, visited, out);
             let rolled = if subtree_identical {
                 EntryStatus::Identical
             } else {
@@ -415,7 +498,14 @@ fn run_scan(source: &dyn DirSource, cancel: &AtomicBool, tx: &Sender<ScanEvent>)
             }
         };
 
-        merge(source, Path::new(""), 0, cancel, &mut emit);
+        merge(
+            source,
+            Path::new(""),
+            0,
+            cancel,
+            &mut HashSet::new(),
+            &mut emit,
+        );
     }
 
     let _ = tx.send(ScanEvent::Done {
@@ -531,6 +621,7 @@ mod tests {
             Path::new(""),
             0,
             &cancel,
+            &mut HashSet::new(),
             &mut |event| match event {
                 ScanEvent::Entry(row) => rows.push(*row),
                 ScanEvent::Update { rel, status } => updates.push((rel, status)),
@@ -657,7 +748,155 @@ mod tests {
             .both("c", "3");
         let cancel = AtomicBool::new(true);
         let mut count = 0;
-        merge(&src, Path::new(""), 0, &cancel, &mut |_| count += 1);
+        merge(
+            &src,
+            Path::new(""),
+            0,
+            &cancel,
+            &mut HashSet::new(),
+            &mut |_| count += 1,
+        );
         assert_eq!(count, 0, "a pre-cancelled scan should emit nothing");
+    }
+}
+
+/// Symlink-cycle tests. These use the real filesystem on purpose: the bug they guard
+/// against lives in `FsSource::dir_id`, which the in-memory fake cannot exercise.
+#[cfg(all(test, unix))]
+mod cycle_tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+
+    /// A scratch tree that removes itself. Keyed by name so parallel tests do not collide.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("yadt-cycle-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `root/side/inner/back` is a symlink pointing back at `root/side`.
+    fn looping_tree(root: &Path, side: &str) -> PathBuf {
+        let base = root.join(side);
+        std::fs::create_dir_all(base.join("inner")).unwrap();
+        std::fs::write(base.join("inner/file.txt"), b"x\n").unwrap();
+        // The link sits in `base/inner`, so `..` is `base` -- a true loop back up the path.
+        std::os::unix::fs::symlink("..", base.join("inner/back")).unwrap();
+        base
+    }
+
+    fn scan_with(follow: bool, left: PathBuf, right: PathBuf) -> Vec<DirEntryRow> {
+        let mut source = FsSource::new(left, right);
+        source.follow_symlinks = follow;
+        let cancel = AtomicBool::new(false);
+        let mut rows = Vec::new();
+        merge(
+            &source,
+            Path::new(""),
+            0,
+            &cancel,
+            &mut HashSet::new(),
+            &mut |event| {
+                if let ScanEvent::Entry(row) = event {
+                    rows.push(*row);
+                }
+            },
+        );
+        rows
+    }
+
+    #[test]
+    fn following_symlinks_reports_a_cycle_instead_of_walking_it() {
+        let scratch = Scratch::new("follow");
+        let left = looping_tree(scratch.path(), "l");
+        let right = looping_tree(scratch.path(), "r");
+
+        let rows = scan_with(true, left, right);
+
+        // inner/, inner/file.txt, inner/back -- and nothing beyond the loop.
+        assert_eq!(
+            rows.len(),
+            3,
+            "a cycle must not multiply entries: {:?}",
+            rows.iter()
+                .map(|r| r.rel.display().to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let back = rows
+            .iter()
+            .find(|r| r.rel.ends_with("back"))
+            .expect("the looping link should be reported");
+        assert_eq!(back.status, EntryStatus::Cycle);
+        // Not expandable -- there is nothing beneath it -- but each side still knows it is
+        // a directory, so the panes render it with a trailing slash.
+        assert_eq!(back.kind, EntryKind::Other);
+        assert_eq!(back.kind_on(SideIdx::LEFT), Some(EntryKind::Dir));
+
+        // Nothing below the link was walked.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.rel.to_string_lossy().contains("back/")),
+            "the walk descended into the cycle"
+        );
+    }
+
+    #[test]
+    fn not_following_symlinks_never_descends_and_compares_targets() {
+        let scratch = Scratch::new("nofollow");
+        let left = looping_tree(scratch.path(), "l");
+        let right = looping_tree(scratch.path(), "r");
+
+        let rows = scan_with(false, left, right);
+
+        assert_eq!(rows.len(), 3);
+        let back = rows.iter().find(|r| r.rel.ends_with("back")).unwrap();
+        // Both links point at the same relative target, so they compare equal -- and the
+        // entry is a symlink, not a directory.
+        assert_eq!(back.kind, EntryKind::Symlink);
+        assert_eq!(back.status, EntryStatus::Identical);
+    }
+
+    #[test]
+    fn two_links_to_the_same_sibling_are_not_a_cycle() {
+        // The visited set is per-path, not global: a directory reachable twice by
+        // different routes must be walked both times.
+        let scratch = Scratch::new("sibling");
+        for side in ["l", "r"] {
+            let base = scratch.path().join(side);
+            std::fs::create_dir_all(base.join("target")).unwrap();
+            std::fs::write(base.join("target/f.txt"), b"x\n").unwrap();
+            std::os::unix::fs::symlink("target", base.join("one")).unwrap();
+            std::os::unix::fs::symlink("target", base.join("two")).unwrap();
+        }
+
+        let rows = scan_with(true, scratch.path().join("l"), scratch.path().join("r"));
+
+        assert!(
+            rows.iter().all(|r| r.status != EntryStatus::Cycle),
+            "a sibling link is not a cycle: {:?}",
+            rows.iter()
+                .map(|r| (r.rel.display().to_string(), r.status))
+                .collect::<Vec<_>>()
+        );
+        // Both links were followed and their contents compared.
+        assert!(rows.iter().any(|r| r.rel.ends_with("one/f.txt")));
+        assert!(rows.iter().any(|r| r.rel.ends_with("two/f.txt")));
     }
 }
