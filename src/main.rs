@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_FILE_SIZE / (1024 * 1024))]
     max_file_size: u64,
 
+    /// Collapse runs of identical lines, keeping this many for context.
+    #[arg(short = 'C', long, value_name = "N")]
+    context: Option<u32>,
+
     /// Follow symbolic links when comparing directories.
     #[arg(long)]
     follow_symlinks: bool,
@@ -93,6 +97,7 @@ fn run() -> Result<i32> {
         tab_width: cli.tab_width,
         max_file_size: cli.max_file_size.saturating_mul(1024 * 1024),
         follow_symlinks: cli.follow_symlinks,
+        context: cli.context,
     };
 
     let theme = if cli.no_color || std::env::var_os("NO_COLOR").is_some() {

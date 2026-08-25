@@ -15,7 +15,7 @@ use ratatui::layout::Rect;
 
 use crate::diff::{DiffOptions, FileComparison};
 use crate::dirdiff::{DirEntryRow, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan};
-use crate::model::SideIdx;
+use crate::model::{self, SideIdx, ViewRow};
 use crate::pane::MAX_H_SCROLL;
 use crate::theme::Theme;
 use crate::{Inputs, exit, ui};
@@ -26,6 +26,8 @@ pub struct Options {
     pub tab_width: u8,
     pub max_file_size: u64,
     pub follow_symlinks: bool,
+    /// `Some(n)` starts with equal runs collapsed, keeping `n` lines of context.
+    pub context: Option<u32>,
 }
 
 /// One entry on the view stack.
@@ -38,10 +40,20 @@ pub enum View {
 // File view
 // ---------------------------------------------------------------------------------------
 
+/// Context lines kept either side of a hunk when folding is switched on at runtime.
+pub const DEFAULT_CONTEXT: u32 = 3;
+
 pub struct FileView {
     pub cmp: FileComparison,
-    /// First visible row. One value, both panes — this *is* the synchronized scrolling.
+    /// What the panes draw. One entry per aligned row when unfolded; a collapsed run of
+    /// equal rows becomes a single entry.
+    pub rows: Vec<ViewRow>,
+    /// `Some(n)` collapses equal runs, keeping `n` rows of context. `None` shows every row.
+    pub context: Option<u32>,
+    /// First visible view row. One value, both panes — this *is* the synchronized
+    /// scrolling.
     pub top: usize,
+    /// Cursor position, also a view-row index.
     pub cursor: usize,
     pub h_scroll: u16,
     /// Which side the status bar reports a line number for.
@@ -52,18 +64,78 @@ pub struct FileView {
 
 impl FileView {
     pub fn new(cmp: FileComparison) -> Self {
-        Self {
+        Self::with_context(cmp, None)
+    }
+
+    pub fn with_context(cmp: FileComparison, context: Option<u32>) -> Self {
+        let mut view = Self {
             cmp,
+            rows: Vec::new(),
+            context,
             top: 0,
             cursor: 0,
             h_scroll: 0,
             focus: SideIdx::LEFT,
             viewport: 1,
+        };
+        view.rebuild_rows();
+        view
+    }
+
+    /// Recompute the view rows from the alignment.
+    ///
+    /// The alignment itself is never touched — folding is a view transform — so this is
+    /// cheap enough to run on every toggle without re-diffing.
+    fn rebuild_rows(&mut self) {
+        self.rows = match (self.cmp.alignment.as_ref(), self.context) {
+            (Some(alignment), Some(context)) => model::fold(alignment, context),
+            (Some(alignment), None) => model::unfolded(alignment),
+            (None, _) => Vec::new(),
+        };
+    }
+
+    /// Number of rows on screen, which is not the number of aligned rows once folded.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The aligned row the cursor sits on, for reporting line numbers.
+    pub fn cursor_row(&self) -> Option<u32> {
+        self.rows.get(self.cursor).map(|r| r.anchor())
+    }
+
+    pub fn cursor_is_fold(&self) -> bool {
+        self.rows.get(self.cursor).is_some_and(|r| r.is_fold())
+    }
+
+    /// Total rows hidden by folds, for the status bar.
+    pub fn hidden_rows(&self) -> u32 {
+        self.rows.iter().map(|r| r.hidden()).sum()
+    }
+
+    /// Switch folding on or off, keeping the cursor on the same aligned row.
+    pub fn toggle_fold(&mut self) {
+        let anchor = self.cursor_row();
+        self.context = match self.context {
+            Some(_) => None,
+            None => Some(DEFAULT_CONTEXT),
+        };
+        self.rebuild_rows();
+        if let Some(anchor) = anchor
+            && let Some(index) = model::view_index_of(&self.rows, anchor)
+        {
+            self.cursor = index;
+            self.top = self.cursor.saturating_sub(self.viewport as usize / 3);
         }
     }
 
-    pub fn row_count(&self) -> usize {
-        self.cmp.alignment.as_ref().map_or(0, |a| a.len())
+    /// Expand the fold under the cursor, without changing the global setting.
+    pub fn expand_fold(&mut self) {
+        let Some(ViewRow::Fold { start, end }) = self.rows.get(self.cursor).copied() else {
+            return;
+        };
+        let replacement: Vec<ViewRow> = (start..end).map(ViewRow::Row).collect();
+        self.rows.splice(self.cursor..=self.cursor, replacement);
     }
 
     /// Clamp scroll and cursor against the current viewport.
@@ -93,17 +165,24 @@ impl FileView {
         self.cursor = (self.cursor as isize + delta).clamp(0, rows as isize - 1) as usize;
     }
 
+    /// Jump to the next or previous hunk.
+    ///
+    /// Hunks are recorded against aligned rows, so the target is mapped back through the
+    /// view — a hunk is never inside a fold, since folds only cover equal runs.
     fn goto_hunk(&mut self, forward: bool) {
         let Some(alignment) = self.cmp.alignment.as_ref() else {
             return;
         };
+        let from = self.cursor_row().unwrap_or(0) as usize;
         let hunk = if forward {
-            alignment.hunk_at_or_after(self.cursor + 1)
+            alignment.hunk_at_or_after(from + 1)
         } else {
-            alignment.hunk_before(self.cursor)
+            alignment.hunk_before(from)
         };
-        if let Some(hunk) = hunk {
-            self.cursor = hunk.start as usize;
+        if let Some(hunk) = hunk
+            && let Some(index) = model::view_index_of(&self.rows, hunk.start)
+        {
+            self.cursor = index;
             // Land the hunk a third of the way down rather than at the very top.
             self.top = self.cursor.saturating_sub(self.viewport as usize / 3);
         }
@@ -468,7 +547,13 @@ impl App {
                 } else {
                     exit::IDENTICAL
                 };
-                (vec![View::File(Box::new(FileView::new(cmp)))], code)
+                (
+                    vec![View::File(Box::new(FileView::with_context(
+                        cmp,
+                        opts.context,
+                    )))],
+                    code,
+                )
             }
             Inputs::Dirs { left, right } => {
                 let view = DirView::new(left, right, opts.follow_symlinks);
@@ -548,7 +633,8 @@ impl App {
 
     /// Open the selected directory entry: a directory expands, a file opens a diff.
     fn open_selected(&mut self) {
-        let (max_size, diff_opts) = (self.opts.max_file_size, self.opts.diff);
+        let (max_size, diff_opts, context) =
+            (self.opts.max_file_size, self.opts.diff, self.opts.context);
         let Some(dir) = self.active_dir() else {
             return;
         };
@@ -574,7 +660,8 @@ impl App {
         };
         let cmp = crate::diff::compare_files(&left, &right, max_size, &diff_opts);
         self.status.clear();
-        self.views.push(View::File(Box::new(FileView::new(cmp))));
+        self.views
+            .push(View::File(Box::new(FileView::with_context(cmp, context))));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -645,6 +732,8 @@ impl App {
             }
             KeyCode::Char('H') => view.h_scroll = view.h_scroll.saturating_sub(8),
             KeyCode::Char('0') => view.h_scroll = 0,
+            KeyCode::Char('z') => view.toggle_fold(),
+            KeyCode::Enter => view.expand_fold(),
             KeyCode::Tab => {
                 view.focus = if view.focus == SideIdx::LEFT {
                     SideIdx::RIGHT
@@ -916,5 +1005,171 @@ mod tests {
             status: EntryStatus::Identical,
         });
         assert_eq!(v.differing, 0);
+    }
+}
+
+#[cfg(test)]
+mod fold_view_tests {
+    use super::*;
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{FileContent, decode};
+
+    fn content(body: &str) -> FileContent {
+        FileContent::Text(Box::new(decode(
+            std::path::Path::new("x"),
+            body.as_bytes().to_vec(),
+            None,
+        )))
+    }
+
+    /// A file with a change, then a long identical run, then another change.
+    fn view(context: Option<u32>) -> FileView {
+        let left: String = std::iter::once("HEAD-LEFT")
+            .chain(std::iter::repeat_n("same", 20))
+            .chain(std::iter::once("TAIL-LEFT"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let right: String = std::iter::once("HEAD-RIGHT")
+            .chain(std::iter::repeat_n("same", 20))
+            .chain(std::iter::once("TAIL-RIGHT"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cmp = compare_loaded(
+            content(&format!("{left}\n")),
+            content(&format!("{right}\n")),
+            &DiffOptions::default(),
+        );
+        let mut v = FileView::with_context(cmp, context);
+        v.viewport = 10;
+        v
+    }
+
+    #[test]
+    fn folding_shrinks_the_view_without_touching_the_alignment() {
+        let unfolded = view(None);
+        let folded = view(Some(3));
+
+        let aligned = unfolded.cmp.alignment.as_ref().unwrap().len();
+        assert_eq!(unfolded.row_count(), aligned);
+        assert!(
+            folded.row_count() < unfolded.row_count(),
+            "folding should collapse the identical run"
+        );
+        // The alignment is identical in both -- folding is a view transform.
+        assert_eq!(folded.cmp.alignment.as_ref().unwrap().len(), aligned);
+        assert!(folded.hidden_rows() > 0);
+        assert_eq!(unfolded.hidden_rows(), 0);
+    }
+
+    #[test]
+    fn every_aligned_row_is_still_reachable_when_folded() {
+        let folded = view(Some(3));
+        let aligned = folded.cmp.alignment.as_ref().unwrap().len() as u32;
+        let mut covered = Vec::new();
+        for r in &folded.rows {
+            match *r {
+                ViewRow::Row(i) => covered.push(i),
+                ViewRow::Fold { start, end } => covered.extend(start..end),
+            }
+        }
+        assert_eq!(covered, (0..aligned).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn toggling_keeps_the_cursor_on_the_same_aligned_row() {
+        let mut v = view(None);
+        // Park on the last row, which is a change.
+        v.cursor = v.row_count() - 1;
+        let before = v.cursor_row().unwrap();
+
+        v.toggle_fold();
+        assert_eq!(v.context, Some(DEFAULT_CONTEXT));
+        assert_eq!(
+            v.cursor_row(),
+            Some(before),
+            "the cursor drifted when folding"
+        );
+
+        v.toggle_fold();
+        assert_eq!(v.context, None);
+        assert_eq!(
+            v.cursor_row(),
+            Some(before),
+            "the cursor drifted when unfolding"
+        );
+    }
+
+    #[test]
+    fn a_cursor_inside_a_hidden_run_lands_on_the_fold() {
+        let mut v = view(None);
+        // Row 10 is deep inside the identical run.
+        v.cursor = 10;
+        v.toggle_fold();
+        assert!(
+            v.cursor_is_fold(),
+            "a cursor on a hidden row should land on the fold standing in for it"
+        );
+    }
+
+    #[test]
+    fn hunk_navigation_works_across_folds() {
+        let mut v = view(Some(3));
+        v.cursor = 0;
+        let first = v.cursor_row().unwrap();
+
+        v.goto_hunk(true);
+        let second = v.cursor_row().unwrap();
+        assert!(second > first, "n should move forward past the fold");
+        assert!(!v.cursor_is_fold(), "a hunk is never inside a fold");
+
+        v.goto_hunk(false);
+        assert_eq!(v.cursor_row(), Some(first), "p should come back");
+    }
+
+    #[test]
+    fn expanding_a_fold_reveals_exactly_its_rows() {
+        let mut v = view(Some(3));
+        let fold_index = v
+            .rows
+            .iter()
+            .position(|r| r.is_fold())
+            .expect("the run should be folded");
+        let hidden = v.rows[fold_index].hidden();
+        let before = v.row_count();
+
+        v.cursor = fold_index;
+        v.expand_fold();
+
+        assert_eq!(v.row_count(), before - 1 + hidden as usize);
+        assert!(v.rows.iter().all(|r| !r.is_fold()));
+        assert_eq!(v.hidden_rows(), 0);
+    }
+
+    #[test]
+    fn expanding_a_plain_row_does_nothing() {
+        let mut v = view(Some(3));
+        v.cursor = 0;
+        let before = v.row_count();
+        v.expand_fold();
+        assert_eq!(v.row_count(), before);
+    }
+
+    #[test]
+    fn folding_a_comparison_with_no_alignment_is_harmless() {
+        let cmp = compare_loaded(
+            content("text\n"),
+            FileContent::Binary {
+                path: "b".into(),
+                size: 1,
+                reason: crate::text::BinaryReason::Nul,
+            },
+            &DiffOptions::default(),
+        );
+        let mut v = FileView::with_context(cmp, Some(3));
+        assert_eq!(v.row_count(), 0);
+        v.toggle_fold();
+        v.expand_fold();
+        v.goto_hunk(true);
+        assert_eq!(v.cursor_row(), None);
     }
 }

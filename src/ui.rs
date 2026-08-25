@@ -388,6 +388,7 @@ fn draw_file_body(
         frame.render_widget(
             DiffPane {
                 alignment,
+                rows: &view.rows,
                 text,
                 side,
                 top: view.top,
@@ -414,7 +415,20 @@ fn draw_markers(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Them
     };
     let mut lines = Vec::with_capacity(area.height as usize);
     for dy in 0..area.height {
-        let Some(row) = alignment.row(view.top + dy as usize) else {
+        let Some(view_row) = view.rows.get(view.top + dy as usize).copied() else {
+            break;
+        };
+        // A fold covers only equal rows, so it never hides a marker.
+        if view_row.is_fold() {
+            let style = if view.top + dy as usize == view.cursor {
+                theme.cursor(theme.fold)
+            } else {
+                theme.fold
+            };
+            lines.push(Line::from(Span::styled("\u{22ef}  ".to_string(), style)));
+            continue;
+        }
+        let Some(row) = alignment.row(view_row.anchor() as usize) else {
             break;
         };
         let glyph = match row.kind {
@@ -487,7 +501,9 @@ fn draw_file_status(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &
         parts.push(format!("row {}/{}", view.cursor + 1, rows));
     }
     if let Some(alignment) = view.cmp.alignment.as_ref() {
-        let line_at = |side: SideIdx| match alignment.cell(view.cursor, side) {
+        let anchor = view.cursor_row().unwrap_or(0) as usize;
+        let line_at = |side: SideIdx| match alignment.cell(anchor, side) {
+            _ if view.cursor_is_fold() => "\u{22ef}".to_string(),
             Cell::Line(n) => n.display().to_string(),
             Cell::Filler => "-".to_string(),
         };
@@ -511,6 +527,14 @@ fn draw_file_status(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &
     if view.h_scroll > 0 {
         parts.push(format!("col +{}", view.h_scroll));
     }
+    if let Some(context) = view.context {
+        let hidden = view.hidden_rows();
+        parts.push(if hidden > 0 {
+            format!("folded -{hidden} (ctx {context})")
+        } else {
+            format!("fold on (ctx {context})")
+        });
+    }
     parts.push("? help".to_string());
     parts.push("q quit".to_string());
 
@@ -533,6 +557,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
         ("h l / arrows", "scroll horizontally"),
         ("H L", "scroll horizontally by 8"),
         ("0", "back to column 0"),
+        ("z", "fold / unfold identical runs"),
+        ("Enter", "expand the fold under the cursor"),
         ("Tab", "switch focused side"),
         ("?", "toggle this help"),
         ("Esc", "back, or quit"),
@@ -647,6 +673,7 @@ mod render_tests {
             tab_width: 8,
             max_file_size: u64::MAX,
             follow_symlinks: false,
+            context: None,
         };
         // Build the view directly: App::new goes through the filesystem.
         let cmp = compare_loaded(left, right, &opts.diff);
@@ -777,6 +804,7 @@ mod dir_render_tests {
             tab_width: 8,
             max_file_size: u64::MAX,
             follow_symlinks: false,
+            context: None,
         };
         // Point the scan at a directory that exists but is empty of interest; the rows
         // below replace whatever it finds.
@@ -990,6 +1018,7 @@ mod cursor_tests {
             tab_width: 8,
             max_file_size: u64::MAX,
             follow_symlinks: false,
+            context: None,
         };
         let cmp = compare_loaded(content("a", left), content("b", right), &opts.diff);
         let mut app = App::new(

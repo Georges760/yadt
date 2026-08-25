@@ -27,6 +27,7 @@ pub struct Theme {
     pub header_focus: Style,
     pub status: Style,
     pub marker: Style,
+    pub fold: Style,
     pub warning: Style,
 }
 
@@ -47,6 +48,10 @@ impl Theme {
             header_focus: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             status: Style::new().fg(Color::Gray),
             marker: Style::new().fg(Color::DarkGray),
+            fold: Style::new()
+                .fg(Color::DarkGray)
+                .bg(Color::Rgb(22, 22, 26))
+                .add_modifier(Modifier::ITALIC),
             warning: Style::new().fg(Color::Yellow),
         }
     }
@@ -70,6 +75,7 @@ impl Theme {
             header_focus: plain.add_modifier(Modifier::BOLD),
             status: plain,
             marker: plain,
+            fold: plain.add_modifier(Modifier::DIM),
             warning: plain.add_modifier(Modifier::BOLD),
         }
     }

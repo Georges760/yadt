@@ -679,3 +679,237 @@ mod tests {
         assert_eq!(a.line_count(SideIdx::RIGHT), 2);
     }
 }
+
+// ------------------------------------------------------------------------------------
+// Folding
+// ------------------------------------------------------------------------------------
+//
+// Collapsing long identical stretches is a *view* transform: it produces a separate list
+// of view rows and never touches the `Alignment`, which stays a pure function of its
+// inputs. That is what lets folding be toggled at runtime without recomputing the diff.
+
+/// One row as the panes see it: either an aligned row, or a collapsed run of equal ones.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewRow {
+    Row(u32),
+    /// A collapsed run, covering `start..end` of [`Alignment::rows`].
+    Fold {
+        start: u32,
+        end: u32,
+    },
+}
+
+impl ViewRow {
+    /// The aligned row this view row starts at — where the cursor lands, and what a fold
+    /// toggle uses to keep its place.
+    pub const fn anchor(self) -> u32 {
+        match self {
+            Self::Row(i) => i,
+            Self::Fold { start, .. } => start,
+        }
+    }
+
+    /// How many aligned rows this hides. Zero for a plain row.
+    pub const fn hidden(self) -> u32 {
+        match self {
+            Self::Row(_) => 0,
+            Self::Fold { start, end } => end - start,
+        }
+    }
+
+    pub const fn is_fold(self) -> bool {
+        matches!(self, Self::Fold { .. })
+    }
+}
+
+/// Every row, unfolded. The identity transform.
+pub fn unfolded(alignment: &Alignment) -> Vec<ViewRow> {
+    (0..alignment.len() as u32).map(ViewRow::Row).collect()
+}
+
+/// Collapse runs of equal rows, keeping `context` rows on each side of every hunk.
+///
+/// A run at the very start or end of the file needs context on one side only, since there
+/// is no hunk beyond it — the same rule `diff -U` follows. A run is left alone unless
+/// folding it would actually hide something: replacing one row with a one-row summary
+/// costs content and saves nothing.
+pub fn fold(alignment: &Alignment, context: u32) -> Vec<ViewRow> {
+    let rows = alignment.rows();
+    let total = rows.len();
+    let context = context as usize;
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < total {
+        if !rows[i].kind.is_equal() {
+            out.push(ViewRow::Row(i as u32));
+            i += 1;
+            continue;
+        }
+
+        // The maximal run of equal rows starting at `i`.
+        let mut end = i;
+        while end < total && rows[end].kind.is_equal() {
+            end += 1;
+        }
+
+        let lead = if i == 0 { 0 } else { context };
+        let trail = if end == total { 0 } else { context };
+        let run = end - i;
+
+        // Fold only when at least two rows disappear.
+        if run > lead + trail + 1 {
+            out.extend((i..i + lead).map(|k| ViewRow::Row(k as u32)));
+            out.push(ViewRow::Fold {
+                start: (i + lead) as u32,
+                end: (end - trail) as u32,
+            });
+            out.extend((end - trail..end).map(|k| ViewRow::Row(k as u32)));
+        } else {
+            out.extend((i..end).map(|k| ViewRow::Row(k as u32)));
+        }
+        i = end;
+    }
+
+    out
+}
+
+/// Which view row shows `alignment_row`, or the fold that swallowed it.
+///
+/// View rows are ordered and non-overlapping, so this is a binary search rather than a
+/// lookup table.
+pub fn view_index_of(rows: &[ViewRow], alignment_row: u32) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let i = rows.partition_point(|r| match *r {
+        ViewRow::Row(n) => n < alignment_row,
+        ViewRow::Fold { end, .. } => end <= alignment_row,
+    });
+    Some(i.min(rows.len() - 1))
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    /// Build an alignment from a pattern: '=' equal, 'x' changed.
+    fn alignment(pattern: &str) -> Alignment {
+        let mut b = AlignmentBuilder::new(2);
+        for c in pattern.chars() {
+            match c {
+                '=' => {
+                    b.push_equal(1);
+                }
+                _ => {
+                    b.push_block(RowKind::Changed, [1, 1, 0]);
+                }
+            }
+        }
+        b.finish()
+    }
+
+    /// Render view rows compactly: a digit per kept row, `[n]` for a fold hiding n rows.
+    fn dump(rows: &[ViewRow]) -> String {
+        rows.iter()
+            .map(|r| match *r {
+                ViewRow::Row(i) => format!("{i} "),
+                ViewRow::Fold { start, end } => format!("[{}] ", end - start),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_short_equal_run_is_left_alone() {
+        // Nothing to gain: folding 1 row into a 1-row summary hides content for free.
+        let a = alignment("x==x");
+        assert_eq!(dump(&fold(&a, 3)), "0 1 2 3 ");
+    }
+
+    #[test]
+    fn a_long_middle_run_collapses_keeping_context_on_both_sides() {
+        let a = alignment("x==========x");
+        // 1 changed, 10 equal, 1 changed; context 2 keeps 2 either side, hides 6.
+        assert_eq!(dump(&fold(&a, 2)), "0 1 2 [6] 9 10 11 ");
+    }
+
+    #[test]
+    fn a_leading_run_needs_context_on_one_side_only() {
+        // Nothing precedes the file, so the head of the run is not context for anything.
+        let a = alignment("=====x");
+        assert_eq!(dump(&fold(&a, 2)), "[3] 3 4 5 ");
+    }
+
+    #[test]
+    fn a_trailing_run_needs_context_on_one_side_only() {
+        let a = alignment("x=====");
+        assert_eq!(dump(&fold(&a, 2)), "0 1 2 [3] ");
+    }
+
+    #[test]
+    fn a_wholly_identical_file_collapses_to_a_single_fold() {
+        let a = alignment("========");
+        assert_eq!(dump(&fold(&a, 3)), "[8] ");
+    }
+
+    #[test]
+    fn zero_context_still_keeps_the_changed_rows() {
+        let a = alignment("x=====x");
+        assert_eq!(dump(&fold(&a, 0)), "0 [5] 6 ");
+    }
+
+    #[test]
+    fn a_file_with_no_equal_rows_is_unchanged() {
+        let a = alignment("xxx");
+        assert_eq!(dump(&fold(&a, 3)), "0 1 2 ");
+    }
+
+    #[test]
+    fn an_empty_alignment_folds_to_nothing() {
+        let a = alignment("");
+        assert!(fold(&a, 3).is_empty());
+        assert!(unfolded(&a).is_empty());
+        assert_eq!(view_index_of(&[], 0), None);
+    }
+
+    #[test]
+    fn folding_never_loses_or_reorders_rows() {
+        let a = alignment("x===========x==x=======");
+        let rows = fold(&a, 2);
+        let mut covered = Vec::new();
+        for r in &rows {
+            match *r {
+                ViewRow::Row(i) => covered.push(i),
+                ViewRow::Fold { start, end } => covered.extend(start..end),
+            }
+        }
+        assert_eq!(
+            covered,
+            (0..a.len() as u32).collect::<Vec<_>>(),
+            "the view must cover every aligned row exactly once, in order"
+        );
+    }
+
+    #[test]
+    fn view_index_finds_kept_rows_and_the_fold_that_hides_the_rest() {
+        let a = alignment("x==========x");
+        let rows = fold(&a, 2);
+        // 0 1 2 [3..9] 9 10 11
+        assert_eq!(view_index_of(&rows, 0), Some(0));
+        assert_eq!(view_index_of(&rows, 2), Some(2));
+        // A hidden row resolves to the fold standing in for it.
+        assert_eq!(view_index_of(&rows, 5), Some(3));
+        assert!(rows[3].is_fold());
+        assert_eq!(view_index_of(&rows, 9), Some(4));
+        assert_eq!(view_index_of(&rows, 11), Some(6));
+    }
+
+    #[test]
+    fn the_unfolded_view_is_the_identity() {
+        let a = alignment("x==x");
+        let rows = unfolded(&a);
+        assert_eq!(rows.len(), a.len());
+        assert!(rows.iter().all(|r| !r.is_fold()));
+        assert_eq!(view_index_of(&rows, 2), Some(2));
+    }
+}

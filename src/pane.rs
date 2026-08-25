@@ -13,7 +13,7 @@ use ratatui::widgets::Widget;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::model::{Alignment, Cell, Emph, SideIdx};
+use crate::model::{Alignment, Cell, Emph, SideIdx, ViewRow};
 use crate::text::TextFile;
 use crate::theme::Theme;
 
@@ -27,6 +27,9 @@ pub const MAX_H_SCROLL: u16 = 10_000;
 
 pub struct DiffPane<'a> {
     pub alignment: &'a Alignment,
+    /// What to draw, in order. Usually one entry per aligned row, but a collapsed run of
+    /// equal rows appears as a single [`ViewRow::Fold`].
+    pub rows: &'a [ViewRow],
     pub text: &'a TextFile,
     pub side: SideIdx,
     /// First visible row. Shared with the other pane — this is what makes scrolling
@@ -51,16 +54,25 @@ impl Widget for DiffPane<'_> {
         let text_width = area.width.saturating_sub(gutter + 1);
 
         for dy in 0..area.height {
-            let row_index = self.top + dy as usize;
+            let view_index = self.top + dy as usize;
             let y = area.y + dy;
-            let Some(row) = self.alignment.row(row_index) else {
+            let Some(view_row) = self.rows.get(view_index).copied() else {
                 break;
             };
-            let cell = row.cells[self.side.idx()];
-            let mut style = self.theme.row_style(row.kind, cell, side_is_left);
             // Not gated on `focused`: both panes render the same row index, so the cursor
             // belongs on both. Which side has focus is shown by the gutter instead.
-            let on_cursor = row_index == self.cursor;
+            let on_cursor = view_index == self.cursor;
+
+            let (cell, mut style) = match view_row {
+                ViewRow::Fold { .. } => (Cell::Filler, self.theme.fold),
+                ViewRow::Row(i) => {
+                    let Some(row) = self.alignment.row(i as usize) else {
+                        break;
+                    };
+                    let cell = row.cells[self.side.idx()];
+                    (cell, self.theme.row_style(row.kind, cell, side_is_left))
+                }
+            };
             if on_cursor {
                 style = self.theme.cursor(style);
             }
@@ -75,6 +87,19 @@ impl Widget for DiffPane<'_> {
                 },
                 style,
             );
+
+            if let ViewRow::Fold { start, end } = view_row {
+                // The summary stands in for the hidden rows, and says how many.
+                let hidden = end - start;
+                let label = format!(
+                    "{:>width$} \u{22ef} {hidden} identical line{}",
+                    "",
+                    if hidden == 1 { "" } else { "s" },
+                    width = gutter as usize,
+                );
+                buf.set_stringn(area.x, y, &label, area.width as usize, style);
+                continue;
+            }
 
             if let Cell::Line(n) = cell {
                 let gutter_style = if self.focused {
@@ -94,7 +119,7 @@ impl Widget for DiffPane<'_> {
                 if text_width > 0 {
                     let emph: Vec<Emph> = self
                         .alignment
-                        .emphasis(row_index, self.side)
+                        .emphasis(view_row.anchor() as usize, self.side)
                         .copied()
                         .collect();
                     draw_line(
