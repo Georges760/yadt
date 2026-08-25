@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_FILE_SIZE / (1024 * 1024))]
     max_file_size: u64,
 
+    /// Follow symbolic links when comparing directories.
+    #[arg(long)]
+    follow_symlinks: bool,
+
     /// Skip word-level highlighting inside changed lines.
     #[arg(long)]
     no_inline: bool,
@@ -88,6 +92,7 @@ fn run() -> Result<i32> {
         },
         tab_width: cli.tab_width,
         max_file_size: cli.max_file_size.saturating_mul(1024 * 1024),
+        follow_symlinks: cli.follow_symlinks,
     };
 
     let theme = if cli.no_color || std::env::var_os("NO_COLOR").is_some() {
@@ -108,7 +113,7 @@ fn run() -> Result<i32> {
     let mut app = App::new(inputs, opts, theme)?;
 
     if cli.quiet {
-        return Ok(app.exit_code());
+        return Ok(app.exit_code_blocking());
     }
 
     // `run` restores the terminal on every path out: normal return, the `?` below, and a

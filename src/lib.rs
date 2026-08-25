@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod diff;
+pub mod dirdiff;
 pub mod model;
 pub mod pane;
 pub mod text;

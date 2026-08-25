@@ -6,8 +6,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 
-use crate::app::{App, FileView, View};
+use crate::app::{App, DirView, FileView, View};
 use crate::diff::human_size;
+use crate::dirdiff::EntryStatus;
 use crate::model::{Cell, RowKind, SideIdx};
 use crate::pane::DiffPane;
 use crate::text::{FileContent, TextFile};
@@ -30,6 +31,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let (header, body, status) = (chunks[0], chunks[1], chunks[2]);
     let theme = app.theme;
     let tab_width = app.opts.tab_width;
+    let message = app.status.clone();
 
     match app.views.last_mut() {
         Some(View::File(view)) => {
@@ -38,12 +40,157 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             draw_file_body(frame, body, view, &theme, tab_width);
             draw_file_status(frame, status, view, &theme);
         }
+        Some(View::Dir(view)) => {
+            view.clamp(body);
+            draw_dir_header(frame, header, view, &theme);
+            draw_dir_body(frame, body, view, &theme);
+            draw_dir_status(frame, status, view, &theme, &message);
+        }
         None => {}
     }
 
     if app.help_visible {
-        draw_help(frame, area, &theme);
+        draw_help(
+            frame,
+            area,
+            &theme,
+            matches!(app.views.last(), Some(View::Dir(_))),
+        );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Directory view
+// ---------------------------------------------------------------------------------------
+
+fn draw_dir_header(frame: &mut Frame<'_>, area: Rect, view: &DirView, theme: &Theme) {
+    let [left, _, right] = pane_columns(area);
+    render_path(frame, left, &view.roots[0], false, theme);
+    render_path(frame, right, &view.roots[1], false, theme);
+}
+
+fn draw_dir_body(frame: &mut Frame<'_>, area: Rect, view: &mut DirView, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (top, cursor, filter) = (view.top, view.cursor, view.filter);
+    let visible: Vec<usize> = view.visible().to_vec();
+
+    if visible.is_empty() {
+        let text = if view.done {
+            match filter {
+                crate::app::DirFilter::All => "the two directories are empty".to_string(),
+                _ => format!("nothing to show with filter '{}' — press f", filter.label()),
+            }
+        } else {
+            "scanning\u{2026}".to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {text}"), theme.status))),
+            area,
+        );
+        return;
+    }
+
+    let width = area.width as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+
+    for (offset, &row_index) in visible
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(area.height as usize)
+    {
+        let row = &view.rows[row_index];
+        let indent = "  ".repeat(row.depth as usize);
+        let marker = if row.kind.is_dir() {
+            if view.is_collapsed(&row.rel) {
+                "\u{25b8} " // ▸ collapsed
+            } else {
+                "\u{25be} " // ▾ expanded
+            }
+        } else {
+            "  "
+        };
+        let name = format!("{}{}", row.name(), if row.kind.is_dir() { "/" } else { "" });
+        let detail = row.status.describe();
+
+        // Pad to the full width so the row background reaches the pane edge.
+        let left = format!(" {} {indent}{marker}{name}", row.status.glyph());
+        let pad = width
+            .saturating_sub(left.chars().count())
+            .saturating_sub(detail.chars().count() + 1);
+        let text = format!("{left}{}{detail} ", " ".repeat(pad));
+
+        let mut style = status_style(row.status, theme);
+        if offset == cursor {
+            style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+        }
+        lines.push(Line::from(Span::styled(
+            truncate_right(&text, width),
+            style,
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn status_style(status: EntryStatus, theme: &Theme) -> Style {
+    match status {
+        EntryStatus::Identical => theme.equal,
+        EntryStatus::Differing => theme.changed,
+        EntryStatus::OnlyIn(SideIdx::LEFT) => theme.removed,
+        EntryStatus::OnlyIn(_) => theme.added,
+        EntryStatus::TypeMismatch | EntryStatus::Unreadable(_) => theme.warning,
+        EntryStatus::Pending => theme.filler,
+    }
+}
+
+fn truncate_right(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    s.chars().take(width).collect()
+}
+
+fn draw_dir_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &mut DirView,
+    theme: &Theme,
+    message: &str,
+) {
+    let (scanned, differing, done, filter) = (view.scanned, view.differing, view.done, view.filter);
+    let errors = view.errors.len();
+    let shown = view.visible().len();
+
+    let mut parts = Vec::new();
+    if !message.is_empty() {
+        parts.push(message.to_string());
+    }
+    parts.push(if done {
+        format!("{scanned} entries")
+    } else {
+        format!("scanning\u{2026} {scanned}")
+    });
+    parts.push(format!("{differing} differing"));
+    if shown != scanned {
+        parts.push(format!("{shown} shown"));
+    }
+    parts.push(format!("filter: {}", filter.label()));
+    if errors > 0 {
+        parts.push(format!("{errors} errors"));
+    }
+    parts.push("? help".to_string());
+    parts.push("q quit".to_string());
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", parts.join(" \u{b7} ")),
+            theme.status,
+        ))),
+        area,
+    );
 }
 
 fn draw_file_header(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
@@ -260,8 +407,8 @@ fn draw_file_status(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &
     );
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    const HELP: &[(&str, &str)] = &[
+fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
+    const FILE_HELP: &[(&str, &str)] = &[
         ("j k / arrows", "move down / up"),
         ("Ctrl-d Ctrl-u", "half page"),
         ("PgDn PgUp Space b", "page"),
@@ -275,9 +422,23 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         ("Esc", "back, or quit"),
         ("q  Ctrl-C", "quit"),
     ];
+    const DIR_HELP: &[(&str, &str)] = &[
+        ("j k / arrows", "move down / up"),
+        ("Ctrl-d Ctrl-u", "half page"),
+        ("PgDn PgUp Space b", "page"),
+        ("g G", "first / last entry"),
+        ("n p", "next / previous difference"),
+        ("Enter", "open a diff, or fold a directory"),
+        ("l h / arrows", "expand / collapse"),
+        ("f", "cycle filter: all / changes / differing"),
+        ("r", "rescan"),
+        ("?", "toggle this help"),
+        ("Esc  q  Ctrl-C", "quit"),
+    ];
 
-    let width = 44.min(area.width);
-    let height = (HELP.len() as u16 + 2).min(area.height);
+    let help = if dir_mode { DIR_HELP } else { FILE_HELP };
+    let width = 48.min(area.width);
+    let height = (help.len() as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -285,7 +446,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         height,
     };
 
-    let lines: Vec<Line> = HELP
+    let lines: Vec<Line> = help
         .iter()
         .map(|(keys, what)| {
             Line::from(vec![
@@ -369,6 +530,7 @@ mod render_tests {
             },
             tab_width: 8,
             max_file_size: u64::MAX,
+            follow_symlinks: false,
         };
         // Build the view directly: App::new goes through the filesystem.
         let cmp = compare_loaded(left, right, &opts.diff);
@@ -453,5 +615,199 @@ mod render_tests {
         let mut app = app_with(content("a.txt", "x\n"), content("b.txt", "y\n"));
         let _ = frame(&mut app, 2, 3);
         let _ = frame(&mut app, 1, 1);
+    }
+}
+
+#[cfg(test)]
+mod dir_render_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::app::{App, DirFilter, Options};
+    use crate::diff::DiffOptions;
+    use crate::dirdiff::{DirEntryRow, EntryKind, EntryStatus, ScanEvent};
+    use crate::model::{MAX_SIDES, SideIdx};
+    use crate::theme::Theme;
+    use crate::{Inputs, app};
+
+    fn row(rel: &str, depth: u16, kind: EntryKind, status: EntryStatus) -> DirEntryRow {
+        DirEntryRow {
+            rel: std::path::PathBuf::from(rel),
+            depth,
+            kind,
+            present: [true, true, false],
+            status,
+            sizes: [None; MAX_SIDES],
+        }
+    }
+
+    /// An app holding a directory view populated without touching the filesystem.
+    fn dir_app(rows: Vec<DirEntryRow>) -> App {
+        let opts = Options {
+            diff: DiffOptions::default(),
+            tab_width: 8,
+            max_file_size: u64::MAX,
+            follow_symlinks: false,
+        };
+        // Point the scan at a directory that exists but is empty of interest; the rows
+        // below replace whatever it finds.
+        let mut app = App::new(
+            Inputs::Dirs {
+                left: std::env::temp_dir(),
+                right: std::env::temp_dir(),
+            },
+            opts,
+            Theme::no_color(),
+        )
+        .expect("temp dir exists");
+
+        if let Some(dir) = app.active_dir() {
+            dir.stop_scan_for_test();
+            for r in rows {
+                dir.apply_for_test(ScanEvent::Entry(Box::new(r)));
+            }
+            dir.apply_for_test(ScanEvent::Done { cancelled: false });
+        }
+        app
+    }
+
+    fn frame(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| super::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn sample() -> Vec<DirEntryRow> {
+        vec![
+            row("same.txt", 0, EntryKind::File, EntryStatus::Identical),
+            row("changed.txt", 0, EntryKind::File, EntryStatus::Differing),
+            row(
+                "gone.txt",
+                0,
+                EntryKind::File,
+                EntryStatus::OnlyIn(SideIdx::LEFT),
+            ),
+            row("sub", 0, EntryKind::Dir, EntryStatus::Differing),
+            row("sub/b.txt", 1, EntryKind::File, EntryStatus::Differing),
+        ]
+    }
+
+    #[test]
+    fn the_tree_shows_status_glyphs_indentation_and_fold_markers() {
+        let mut app = dir_app(sample());
+        let lines = frame(&mut app, 46, 8);
+
+        // Row 0 is the header. Each entry is "<glyph> <indent><fold> <name>" with the
+        // status right-aligned against the pane edge.
+        assert_eq!(lines[1], "     same.txt                       identical");
+        assert_eq!(
+            lines[2],
+            " \u{25ac}   changed.txt                      differs"
+        );
+        assert_eq!(
+            lines[3],
+            " \u{25c0}   gone.txt                only on the left"
+        );
+        // A directory carries a fold marker and a trailing slash.
+        assert_eq!(
+            lines[4],
+            " \u{25ac} \u{25be} sub/                             differs"
+        );
+        // Its child is indented one level deeper.
+        assert_eq!(
+            lines[5],
+            " \u{25ac}     b.txt                          differs"
+        );
+    }
+
+    #[test]
+    fn collapsing_swaps_the_fold_marker_and_hides_children() {
+        let mut app = dir_app(sample());
+        let dir = app.active_dir().unwrap();
+        dir.collapse_for_test(std::path::Path::new("sub"));
+
+        let lines = frame(&mut app, 46, 8);
+        assert_eq!(
+            lines[4],
+            " \u{25ac} \u{25b8} sub/                             differs"
+        );
+        // b.txt is gone; row 5 is blank.
+        assert_eq!(lines[5], "");
+    }
+
+    #[test]
+    fn the_status_bar_reports_counts_and_the_active_filter() {
+        let mut app = dir_app(sample());
+        let lines = frame(&mut app, 70, 8);
+        let status = lines.last().unwrap();
+        assert!(status.contains("5 entries"), "{status}");
+        assert!(status.contains("4 differing"), "{status}");
+        assert!(status.contains("filter: all"), "{status}");
+    }
+
+    #[test]
+    fn an_empty_filter_result_explains_itself_instead_of_showing_nothing() {
+        let mut app = dir_app(vec![row(
+            "same.txt",
+            0,
+            EntryKind::File,
+            EntryStatus::Identical,
+        )]);
+        app.active_dir().unwrap().filter = DirFilter::DifferingOnly;
+        app.active_dir().unwrap().mark_dirty_for_test();
+
+        let lines = frame(&mut app, 60, 5);
+        assert!(lines[1].contains("nothing to show"), "{:?}", lines[1]);
+        assert!(lines[1].contains("press f"), "{:?}", lines[1]);
+    }
+
+    #[test]
+    fn a_tiny_terminal_does_not_panic() {
+        let mut app = dir_app(sample());
+        let _ = frame(&mut app, 4, 3);
+        let _ = frame(&mut app, 1, 1);
+    }
+
+    #[test]
+    fn the_help_overlay_shows_directory_keys_in_directory_mode() {
+        let mut app = dir_app(sample());
+        app.help_visible = true;
+        let joined = frame(&mut app, 60, 18).join("\n");
+        assert!(joined.contains("cycle filter"), "{joined}");
+        assert!(joined.contains("rescan"), "{joined}");
+        assert!(!joined.contains("switch focused side"), "{joined}");
+    }
+
+    #[test]
+    fn the_help_overlay_shows_file_keys_in_file_mode() {
+        let mut app = dir_app(sample());
+        app.views.push(app::View::File(Box::new(app::FileView::new(
+            crate::diff::compare_loaded(
+                crate::text::FileContent::Text(Box::new(crate::text::decode(
+                    std::path::Path::new("a"),
+                    b"x\n".to_vec(),
+                    None,
+                ))),
+                crate::text::FileContent::Text(Box::new(crate::text::decode(
+                    std::path::Path::new("b"),
+                    b"y\n".to_vec(),
+                    None,
+                ))),
+                &DiffOptions::default(),
+            ),
+        ))));
+        app.help_visible = true;
+        let joined = frame(&mut app, 60, 18).join("\n");
+        assert!(joined.contains("switch focused side"), "{joined}");
+        assert!(!joined.contains("cycle filter"), "{joined}");
     }
 }
