@@ -13,7 +13,8 @@ use ratatui::widgets::Widget;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::model::{Alignment, Cell, Emph, SideIdx, ViewRow};
+use crate::model::{Alignment, Cell, SideIdx, ViewRow};
+use crate::search::Match;
 use crate::text::TextFile;
 use crate::theme::Theme;
 
@@ -41,6 +42,42 @@ pub struct DiffPane<'a> {
     pub tab_width: u8,
     pub theme: &'a Theme,
     pub focused: bool,
+    /// Hits to highlight, sorted by row. Empty when no search is active.
+    pub matches: &'a [Match],
+    /// The one the cursor is parked on, drawn differently from the rest.
+    pub current_match: Option<Match>,
+}
+
+impl DiffPane<'_> {
+    /// Search hits on one aligned row for this side.
+    ///
+    /// Matches are sorted by row, so the run for a row is found by binary search rather
+    /// than scanning the whole set for every visible line.
+    fn search_overlays(&self, row: u32, on_cursor: bool) -> Vec<Overlay> {
+        if self.matches.is_empty() {
+            return Vec::new();
+        }
+        let from = self.matches.partition_point(|m| m.row < row);
+        self.matches[from..]
+            .iter()
+            .take_while(|m| m.row == row)
+            .filter(|m| m.side == self.side)
+            .map(|m| {
+                let is_current = self.current_match == Some(*m);
+                let style = if is_current {
+                    self.theme.search_current
+                } else {
+                    self.theme.search
+                };
+                let style = if on_cursor {
+                    self.theme.cursor(style)
+                } else {
+                    style
+                };
+                Overlay::new(m.start, m.end, style)
+            })
+            .collect()
+    }
 }
 
 impl Widget for DiffPane<'_> {
@@ -117,11 +154,20 @@ impl Widget for DiffPane<'_> {
                 );
 
                 if text_width > 0 {
-                    let emph: Vec<Emph> = self
+                    let aligned = view_row.anchor();
+                    let emph_style = {
+                        let s = self.theme.emph_style(side_is_left);
+                        if on_cursor { self.theme.cursor(s) } else { s }
+                    };
+                    // Emphasis first, search on top: a hit inside a changed word must
+                    // still be findable.
+                    let mut overlays: Vec<Overlay> = self
                         .alignment
-                        .emphasis(view_row.anchor() as usize, self.side)
-                        .copied()
+                        .emphasis(aligned as usize, self.side)
+                        .map(|e| Overlay::new(e.start, e.end, emph_style))
                         .collect();
+                    overlays.extend(self.search_overlays(aligned, on_cursor));
+
                     draw_line(
                         buf,
                         text_x,
@@ -131,15 +177,7 @@ impl Widget for DiffPane<'_> {
                         self.h_scroll,
                         self.tab_width,
                         style,
-                        &emph,
-                        {
-                            let emph = style.patch(self.theme.emph_style(side_is_left));
-                            if on_cursor {
-                                self.theme.cursor(emph)
-                            } else {
-                                emph
-                            }
-                        },
+                        &overlays,
                     );
                 }
             }
@@ -147,13 +185,30 @@ impl Widget for DiffPane<'_> {
     }
 }
 
+/// A byte range of a line that should be drawn in its own style.
+///
+/// Overlays are applied in order, so a later one wins where they overlap — which is how a
+/// search hit shows through word-level emphasis.
+#[derive(Clone, Copy, Debug)]
+pub struct Overlay {
+    pub start: u32,
+    pub end: u32,
+    pub style: Style,
+}
+
+impl Overlay {
+    pub const fn new(start: u32, end: u32, style: Style) -> Self {
+        Self { start, end, style }
+    }
+}
+
 /// Write `line` into `buf` at (`x`, `y`), clipped to `width` display columns, after
 /// skipping `h_scroll` display columns from the left.
 ///
 /// Tabs advance to the next multiple of `tab_width` counted **from the start of the line**,
-/// not from `x` — otherwise the expansion shifts when the gutter width changes. `emph`
-/// holds sorted, non-overlapping byte ranges into `line`; graphemes falling inside one get
-/// `emph_style`.
+/// not from `x` — otherwise the expansion shifts when the gutter width changes.
+/// `overlays` hold byte ranges into `line`; graphemes falling inside one take its style,
+/// with later overlays winning.
 ///
 /// Never walks past `h_scroll + width` columns, so a 10 MB single line costs O(width)
 /// rather than O(line length).
@@ -169,8 +224,7 @@ pub fn draw_line(
     h_scroll: u16,
     tab_width: u8,
     base: Style,
-    emph: &[Emph],
-    emph_style: Style,
+    overlays: &[Overlay],
 ) -> u16 {
     if width == 0 {
         return 0;
@@ -186,11 +240,7 @@ pub fn draw_line(
         if col >= end_col {
             break;
         }
-        let style = if in_emphasis(emph, offset) {
-            emph_style
-        } else {
-            base
-        };
+        let style = style_at(overlays, offset, base);
 
         if grapheme == "\t" {
             let stop = col + (tab_width - col % tab_width);
@@ -248,9 +298,14 @@ pub fn draw_line(
     col.saturating_sub(start_col).min(width as usize) as u16
 }
 
-fn in_emphasis(emph: &[Emph], offset: usize) -> bool {
+/// The style for the grapheme at `offset`: the last overlay covering it, or `base`.
+fn style_at(overlays: &[Overlay], offset: usize, base: Style) -> Style {
     let offset = offset as u32;
-    emph.iter().any(|e| offset >= e.start && offset < e.end)
+    overlays
+        .iter()
+        .rev()
+        .find(|o| offset >= o.start && offset < o.end)
+        .map_or(base, |o| base.patch(o.style))
 }
 
 /// Write one symbol at column `dx` within the pane, if that cell exists.
@@ -316,7 +371,6 @@ mod tests {
             tab_width,
             Style::new(),
             &[],
-            Style::new(),
         );
         row_text(&buf, width)
     }
@@ -365,18 +419,7 @@ mod tests {
     fn wide_graphemes_occupy_two_columns() {
         // Each CJK character is two cells wide; ratatui leaves the trailing cell empty.
         let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
-        draw_line(
-            &mut buf,
-            0,
-            0,
-            6,
-            "日本",
-            0,
-            8,
-            Style::new(),
-            &[],
-            Style::new(),
-        );
+        draw_line(&mut buf, 0, 0, 6, "日本", 0, 8, Style::new(), &[]);
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "日");
         assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "本");
     }
@@ -385,18 +428,7 @@ mod tests {
     fn a_wide_grapheme_clipped_at_the_right_edge_becomes_a_marker() {
         // Width 3: 日 fits at 0..2, 本 would need 2..4 and must not be drawn.
         let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
-        draw_line(
-            &mut buf,
-            0,
-            0,
-            3,
-            "日本",
-            0,
-            8,
-            Style::new(),
-            &[],
-            Style::new(),
-        );
+        draw_line(&mut buf, 0, 0, 3, "日本", 0, 8, Style::new(), &[]);
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "日");
         assert_eq!(buf.cell((2, 0)).unwrap().symbol(), CLIPPED);
     }
@@ -405,18 +437,7 @@ mod tests {
     fn a_wide_grapheme_straddling_the_scroll_edge_becomes_a_marker() {
         // Scrolled to column 1, which is the second half of 日.
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
-        draw_line(
-            &mut buf,
-            0,
-            0,
-            4,
-            "日本",
-            1,
-            8,
-            Style::new(),
-            &[],
-            Style::new(),
-        );
+        draw_line(&mut buf, 0, 0, 4, "日本", 1, 8, Style::new(), &[]);
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), CLIPPED_LEFT);
         assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "本");
     }
@@ -431,18 +452,7 @@ mod tests {
     fn combining_marks_attach_to_the_previous_cell() {
         // "e" followed by U+0301 is one grapheme cluster of width 1.
         let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
-        draw_line(
-            &mut buf,
-            0,
-            0,
-            3,
-            "e\u{301}x",
-            0,
-            8,
-            Style::new(),
-            &[],
-            Style::new(),
-        );
+        draw_line(&mut buf, 0, 0, 3, "e\u{301}x", 0, 8, Style::new(), &[]);
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "e\u{301}");
         assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "x");
     }
@@ -450,14 +460,19 @@ mod tests {
     #[test]
     fn emphasis_applies_to_the_right_byte_range() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 11, 1));
-        let emph = [Emph {
-            side: SideIdx::LEFT,
-            start: 6,
-            end: 11,
-        }];
-        let base = Style::new();
         let hot = Style::new().add_modifier(ratatui::style::Modifier::REVERSED);
-        draw_line(&mut buf, 0, 0, 11, "hello world", 0, 8, base, &emph, hot);
+        let overlays = [Overlay::new(6, 11, hot)];
+        draw_line(
+            &mut buf,
+            0,
+            0,
+            11,
+            "hello world",
+            0,
+            8,
+            Style::new(),
+            &overlays,
+        );
 
         let reversed = |x: u16| {
             buf.cell((x, 0))
@@ -477,13 +492,9 @@ mod tests {
         // "a\tbc": byte 2 is 'b'. After expansion 'b' lands at column 8, not column 2 —
         // this is the offset bug this whole function exists to prevent.
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
-        let emph = [Emph {
-            side: SideIdx::LEFT,
-            start: 2,
-            end: 3,
-        }];
         let hot = Style::new().add_modifier(ratatui::style::Modifier::REVERSED);
-        draw_line(&mut buf, 0, 0, 12, "a\tbc", 0, 8, Style::new(), &emph, hot);
+        let overlays = [Overlay::new(2, 3, hot)];
+        draw_line(&mut buf, 0, 0, 12, "a\tbc", 0, 8, Style::new(), &overlays);
         let reversed = |x: u16| {
             buf.cell((x, 0))
                 .unwrap()
@@ -500,18 +511,7 @@ mod tests {
     #[test]
     fn a_zero_width_pane_draws_nothing_and_does_not_panic() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 0, 1));
-        let written = draw_line(
-            &mut buf,
-            0,
-            0,
-            0,
-            "hello",
-            0,
-            8,
-            Style::new(),
-            &[],
-            Style::new(),
-        );
+        let written = draw_line(&mut buf, 0, 0, 0, "hello", 0, 8, Style::new(), &[]);
         assert_eq!(written, 0);
     }
 
@@ -529,7 +529,6 @@ mod tests {
             8,
             Style::new(),
             &[],
-            Style::new(),
         );
         assert_eq!(row_text(&buf, 3), "a l");
     }

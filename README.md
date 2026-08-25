@@ -61,6 +61,8 @@ directory on one side and a file on the other; `↻` is a symlink cycle.
 | `g` `G` | first / last row |
 | `n` `p` | next / previous hunk |
 | `h` `l` / arrows | scroll horizontally (`H` `L` by 8, `0` to reset) |
+| `/` | search (smart-case) |
+| `N` `P` | next / previous match |
 | `z` | fold / unfold identical runs |
 | `Enter` | expand the fold under the cursor |
 | `Tab` | switch focused side |
@@ -99,6 +101,9 @@ Exit codes follow `diff(1)`: **0** identical, **1** differences found, **2** err
 
 ## Behaviour worth knowing
 
+- **Search** is smart-case: a lower-case query matches any case, a query with a capital
+  matches exactly. `n`/`p` stay bound to hunks and matches are on `N`/`P`, so there are no
+  modes -- both work at once. A hit hidden inside a fold expands it.
 - **Whitespace.** `-w changes` matches GNU `diff -b`: a run of whitespace compares equal
   to any other run, and trailing whitespace is ignored, but whitespace appearing where
   there was none is still a difference. To ignore indentation added to a previously

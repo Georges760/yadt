@@ -28,6 +28,8 @@ pub struct Theme {
     pub status: Style,
     pub marker: Style,
     pub fold: Style,
+    pub search: Style,
+    pub search_current: Style,
     pub warning: Style,
 }
 
@@ -52,6 +54,11 @@ impl Theme {
                 .fg(Color::DarkGray)
                 .bg(Color::Rgb(22, 22, 26))
                 .add_modifier(Modifier::ITALIC),
+            search: Style::new().bg(Color::Rgb(90, 80, 20)).fg(Color::White),
+            search_current: Style::new()
+                .bg(Color::Rgb(200, 160, 40))
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
             warning: Style::new().fg(Color::Yellow),
         }
     }
@@ -76,6 +83,10 @@ impl Theme {
             status: plain,
             marker: plain,
             fold: plain.add_modifier(Modifier::DIM),
+            search: plain.add_modifier(Modifier::REVERSED),
+            search_current: plain
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
             warning: plain.add_modifier(Modifier::BOLD),
         }
     }

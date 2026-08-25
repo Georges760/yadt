@@ -17,6 +17,7 @@ use crate::diff::{DiffOptions, FileComparison};
 use crate::dirdiff::{DirEntryRow, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan};
 use crate::model::{self, SideIdx, ViewRow};
 use crate::pane::MAX_H_SCROLL;
+use crate::search::{self, Match};
 use crate::theme::Theme;
 use crate::{Inputs, exit, ui};
 
@@ -43,6 +44,19 @@ pub enum View {
 /// Context lines kept either side of a hunk when folding is switched on at runtime.
 pub const DEFAULT_CONTEXT: u32 = 3;
 
+/// An active search: the query, every hit, and which one is selected.
+pub struct SearchState {
+    pub query: String,
+    pub matches: Vec<Match>,
+    pub current: usize,
+}
+
+impl SearchState {
+    pub fn current_match(&self) -> Option<Match> {
+        self.matches.get(self.current).copied()
+    }
+}
+
 pub struct FileView {
     pub cmp: FileComparison,
     /// What the panes draw. One entry per aligned row when unfolded; a collapsed run of
@@ -52,6 +66,8 @@ pub struct FileView {
     pub context: Option<u32>,
     /// Recorded only so the status bar can say when comparison is not exact.
     pub whitespace: crate::diff::Whitespace,
+    /// The active search, if any.
+    pub search: Option<SearchState>,
     /// First visible view row. One value, both panes — this *is* the synchronized
     /// scrolling.
     pub top: usize,
@@ -88,6 +104,7 @@ impl FileView {
             h_scroll: 0,
             focus: SideIdx::LEFT,
             viewport: 1,
+            search: None,
         };
         view.rebuild_rows();
         view
@@ -122,6 +139,80 @@ impl FileView {
     /// Total rows hidden by folds, for the status bar.
     pub fn hidden_rows(&self) -> u32 {
         self.rows.iter().map(|r| r.hidden()).sum()
+    }
+
+    /// Run a search and jump to the first hit at or after the cursor.
+    pub fn run_search(&mut self, query: &str) {
+        let Some((left, right)) = self.cmp.texts() else {
+            return;
+        };
+        let Some(alignment) = self.cmp.alignment.as_ref() else {
+            return;
+        };
+        let matches = search::find(alignment, [left, right], query);
+        if matches.is_empty() {
+            self.search = Some(SearchState {
+                query: query.to_string(),
+                matches,
+                current: 0,
+            });
+            return;
+        }
+        let from = self.cursor_row().unwrap_or(0);
+        let current = search::next_from(&matches, from, true).unwrap_or(0);
+        self.search = Some(SearchState {
+            query: query.to_string(),
+            matches,
+            current,
+        });
+        self.reveal_current_match();
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Step to the next or previous hit, wrapping at the ends.
+    pub fn step_match(&mut self, forward: bool) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        let count = state.matches.len();
+        if count == 0 {
+            return;
+        }
+        state.current = if forward {
+            (state.current + 1) % count
+        } else {
+            (state.current + count - 1) % count
+        };
+        self.reveal_current_match();
+    }
+
+    /// Scroll so the selected hit is on screen, expanding a fold if it is hiding it.
+    fn reveal_current_match(&mut self) {
+        let Some(row) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.current_match())
+            .map(|m| m.row)
+        else {
+            return;
+        };
+        let Some(index) = model::view_index_of(&self.rows, row) else {
+            return;
+        };
+        // A hit inside a collapsed run would otherwise be unreachable.
+        if self.rows.get(index).is_some_and(|r| r.is_fold()) {
+            self.cursor = index;
+            self.expand_fold();
+            if let Some(index) = model::view_index_of(&self.rows, row) {
+                self.cursor = index;
+            }
+        } else {
+            self.cursor = index;
+        }
+        self.top = self.cursor.saturating_sub(self.viewport as usize / 3);
     }
 
     /// Switch folding on or off, keeping the cursor on the same aligned row.
@@ -536,8 +627,16 @@ impl DirView {
 // App
 // ---------------------------------------------------------------------------------------
 
+/// A one-line text prompt at the bottom of the screen.
+pub struct Prompt {
+    pub label: &'static str,
+    pub buffer: String,
+}
+
 pub struct App {
     pub views: Vec<View>,
+    /// When set, keystrokes go here instead of to the active view.
+    pub prompt: Option<Prompt>,
     pub opts: Options,
     pub theme: Theme,
     pub help_visible: bool,
@@ -577,6 +676,7 @@ impl App {
             views,
             opts,
             theme,
+            prompt: None,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -681,6 +781,13 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // While a prompt is open it owns the keyboard, so a query can contain q, j, or
+        // anything else that would otherwise be a command.
+        if self.prompt.is_some() {
+            self.handle_prompt_key(key, ctrl);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 self.should_quit = true;
@@ -716,7 +823,62 @@ impl App {
         }
     }
 
+    /// Edit the open prompt. Enter runs it, Esc abandons it.
+    fn handle_prompt_key(&mut self, key: KeyEvent, ctrl: bool) {
+        match key.code {
+            KeyCode::Esc => {
+                self.prompt = None;
+            }
+            KeyCode::Enter => {
+                let query = self.prompt.take().map(|p| p.buffer).unwrap_or_default();
+                if query.is_empty() {
+                    if let Some(view) = self.active_file() {
+                        view.clear_search();
+                    }
+                    return;
+                }
+                if let Some(view) = self.active_file() {
+                    view.run_search(&query);
+                    let found = view.search.as_ref().map_or(0, |s| s.matches.len());
+                    self.status = if found == 0 {
+                        format!("no match for {query:?}")
+                    } else {
+                        String::new()
+                    };
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.buffer.pop();
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.buffer.clear();
+                }
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.prompt = None;
+            }
+            KeyCode::Char(c) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_file_key(&mut self, key: KeyEvent, ctrl: bool) {
+        if key.code == KeyCode::Char('/') {
+            self.prompt = Some(Prompt {
+                label: "/",
+                buffer: String::new(),
+            });
+            self.status.clear();
+            return;
+        }
+
         let page = self.active_file().map_or(1, |v| v.viewport.max(1) as isize);
         let Some(view) = self.active_file() else {
             return;
@@ -747,6 +909,8 @@ impl App {
             KeyCode::Char('H') => view.h_scroll = view.h_scroll.saturating_sub(8),
             KeyCode::Char('0') => view.h_scroll = 0,
             KeyCode::Char('z') => view.toggle_fold(),
+            KeyCode::Char('N') => view.step_match(true),
+            KeyCode::Char('P') => view.step_match(false),
             KeyCode::Enter => view.expand_fold(),
             KeyCode::Tab => {
                 view.focus = if view.focus == SideIdx::LEFT {
@@ -1185,5 +1349,221 @@ mod fold_view_tests {
         v.expand_fold();
         v.goto_hunk(true);
         assert_eq!(v.cursor_row(), None);
+    }
+}
+
+#[cfg(test)]
+mod search_view_tests {
+    use super::*;
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{FileContent, decode};
+    use crossterm::event::KeyModifiers;
+
+    fn content(body: &str) -> FileContent {
+        FileContent::Text(Box::new(decode(
+            std::path::Path::new("x"),
+            body.as_bytes().to_vec(),
+            None,
+        )))
+    }
+
+    fn view(left: &str, right: &str) -> FileView {
+        let cmp = compare_loaded(content(left), content(right), &DiffOptions::default());
+        let mut v = FileView::with_context(cmp, None);
+        v.viewport = 10;
+        v
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn app_with(view: FileView) -> App {
+        App {
+            views: vec![View::File(Box::new(view))],
+            opts: Options {
+                diff: DiffOptions::default(),
+                tab_width: 8,
+                max_file_size: u64::MAX,
+                follow_symlinks: false,
+                context: None,
+            },
+            theme: Theme::no_color(),
+            prompt: None,
+            help_visible: false,
+            status: String::new(),
+            should_quit: false,
+            exit_code: 0,
+        }
+    }
+
+    #[test]
+    fn a_search_finds_hits_and_selects_the_first() {
+        let mut v = view("alpha\nbeta\ngamma\n", "alpha\nbeta\ngamma\n");
+        v.run_search("a");
+        let state = v.search.as_ref().unwrap();
+        assert!(!state.matches.is_empty());
+        assert_eq!(state.current, 0);
+        assert_eq!(state.query, "a");
+    }
+
+    #[test]
+    fn stepping_wraps_around_the_ends() {
+        let mut v = view("one\ntwo\n", "one\ntwo\n");
+        v.run_search("o");
+        let count = v.search.as_ref().unwrap().matches.len();
+        assert!(count >= 2);
+
+        for _ in 0..count {
+            v.step_match(true);
+        }
+        assert_eq!(
+            v.search.as_ref().unwrap().current,
+            0,
+            "stepping all the way round should come back to the first hit"
+        );
+
+        v.step_match(false);
+        assert_eq!(v.search.as_ref().unwrap().current, count - 1);
+    }
+
+    #[test]
+    fn a_search_moves_the_cursor_to_the_hit() {
+        let mut v = view("aaa\nbbb\nneedle\n", "aaa\nbbb\nneedle\n");
+        v.cursor = 0;
+        v.run_search("needle");
+        assert_eq!(v.cursor_row(), Some(2), "the cursor should follow the hit");
+    }
+
+    #[test]
+    fn a_hit_hidden_by_a_fold_expands_it() {
+        // A long identical run with the needle buried in the middle.
+        let body: String = (0..30)
+            .map(|i| {
+                if i == 15 {
+                    "needle".to_string()
+                } else {
+                    format!("line {i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let changed = format!("CHANGED\n{body}\nCHANGED\n");
+        let other = format!("DIFFERENT\n{body}\nDIFFERENT\n");
+        let cmp = compare_loaded(content(&changed), content(&other), &DiffOptions::default());
+        let mut v = FileView::with_context(cmp, Some(2));
+        v.viewport = 10;
+
+        assert!(v.rows.iter().any(|r| r.is_fold()), "the run should fold");
+        v.run_search("needle");
+
+        assert!(
+            !v.cursor_is_fold(),
+            "the hit must be revealed, not left behind a fold"
+        );
+        // The revealed row is a real aligned row, not an index left dangling by the
+        // expansion.
+        assert!(
+            v.cmp
+                .alignment
+                .as_ref()
+                .unwrap()
+                .row(v.cursor_row().unwrap() as usize)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_search_with_no_hits_is_recorded_without_moving_anything() {
+        let mut v = view("alpha\n", "alpha\n");
+        v.cursor = 0;
+        v.run_search("zzzz");
+        let state = v.search.as_ref().unwrap();
+        assert!(state.matches.is_empty());
+        assert_eq!(v.cursor, 0);
+        // Stepping a hitless search must not panic or divide by zero.
+        v.step_match(true);
+        v.step_match(false);
+    }
+
+    #[test]
+    fn the_prompt_captures_keys_that_would_otherwise_be_commands() {
+        let mut app = app_with(view("query here\n", "query here\n"));
+        press(&mut app, '/');
+        assert!(app.prompt.is_some());
+
+        // 'q' would quit outside the prompt; here it is just a letter.
+        for c in "query".chars() {
+            press(&mut app, c);
+        }
+        assert!(!app.should_quit, "typing q in a prompt must not quit");
+        assert_eq!(app.prompt.as_ref().unwrap().buffer, "query");
+
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.prompt.as_ref().unwrap().buffer, "quer");
+
+        key(&mut app, KeyCode::Enter);
+        assert!(app.prompt.is_none(), "Enter should close the prompt");
+        assert!(app.active_file().unwrap().search.is_some());
+    }
+
+    #[test]
+    fn escape_abandons_the_prompt_without_searching() {
+        let mut app = app_with(view("alpha\n", "alpha\n"));
+        press(&mut app, '/');
+        press(&mut app, 'a');
+        key(&mut app, KeyCode::Esc);
+        assert!(app.prompt.is_none());
+        assert!(app.active_file().unwrap().search.is_none());
+        assert!(!app.should_quit, "Esc in a prompt must not pop the view");
+    }
+
+    #[test]
+    fn an_empty_query_clears_the_previous_search() {
+        let mut app = app_with(view("alpha\n", "alpha\n"));
+        press(&mut app, '/');
+        press(&mut app, 'a');
+        key(&mut app, KeyCode::Enter);
+        assert!(app.active_file().unwrap().search.is_some());
+
+        press(&mut app, '/');
+        key(&mut app, KeyCode::Enter);
+        assert!(app.active_file().unwrap().search.is_none());
+    }
+
+    #[test]
+    fn a_failed_search_says_so() {
+        let mut app = app_with(view("alpha\n", "alpha\n"));
+        press(&mut app, '/');
+        for c in "zzz".chars() {
+            press(&mut app, c);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.status.contains("no match"),
+            "status was {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn hunk_keys_still_work_while_a_search_is_active() {
+        // n/p stay bound to hunks; matches are on N/P. No modes.
+        let mut app = app_with(view("same\nold\n", "same\nnew\n"));
+        press(&mut app, '/');
+        press(&mut app, 's');
+        key(&mut app, KeyCode::Enter);
+
+        press(&mut app, 'n');
+        let view = app.active_file().unwrap();
+        assert_eq!(
+            view.cursor_row(),
+            Some(1),
+            "n should still jump to the hunk"
+        );
     }
 }

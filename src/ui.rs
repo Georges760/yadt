@@ -40,7 +40,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             view.clamp(body);
             draw_file_header(frame, header, view, &theme);
             draw_file_body(frame, body, view, &theme, tab_width);
-            draw_file_status(frame, status, view, &theme);
+            draw_file_status(frame, status, view, &theme, &message);
         }
         Some(View::Dir(view)) => {
             view.clamp(body);
@@ -49,6 +49,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             draw_dir_status(frame, status, view, &theme, &message);
         }
         None => {}
+    }
+
+    if let Some(prompt) = app.prompt.as_ref() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prompt.label.to_string(), theme.header_focus),
+                Span::styled(prompt.buffer.clone(), theme.status),
+                Span::styled("\u{2588}".to_string(), theme.header_focus),
+            ])),
+            status,
+        );
     }
 
     if app.help_visible {
@@ -389,6 +400,8 @@ fn draw_file_body(
             DiffPane {
                 alignment,
                 rows: &view.rows,
+                matches: view.search.as_ref().map_or(&[][..], |s| &s.matches),
+                current_match: view.search.as_ref().and_then(|s| s.current_match()),
                 text,
                 side,
                 top: view.top,
@@ -493,9 +506,18 @@ fn describe(content: &FileContent) -> String {
     }
 }
 
-fn draw_file_status(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
+fn draw_file_status(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &FileView,
+    theme: &Theme,
+    message: &str,
+) {
     let rows = view.row_count();
     let mut parts = Vec::new();
+    if !message.is_empty() {
+        parts.push(message.to_string());
+    }
 
     if rows > 0 {
         parts.push(format!("row {}/{}", view.cursor + 1, rows));
@@ -526,6 +548,18 @@ fn draw_file_status(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &
     }
     if view.h_scroll > 0 {
         parts.push(format!("col +{}", view.h_scroll));
+    }
+    if let Some(search) = view.search.as_ref() {
+        parts.push(if search.matches.is_empty() {
+            format!("/{} no match", search.query)
+        } else {
+            format!(
+                "/{} {}/{}",
+                search.query,
+                search.current + 1,
+                search.matches.len()
+            )
+        });
     }
     if view.whitespace != crate::diff::Whitespace::Exact {
         parts.push(format!("ws: {}", view.whitespace.label()));
@@ -560,6 +594,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
         ("h l / arrows", "scroll horizontally"),
         ("H L", "scroll horizontally by 8"),
         ("0", "back to column 0"),
+        ("/", "search"),
+        ("N", "next match"),
+        ("P", "previous match"),
         ("z", "fold / unfold identical runs"),
         ("Enter", "expand the fold under the cursor"),
         ("Tab", "switch focused side"),

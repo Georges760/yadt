@@ -9,6 +9,7 @@ pub mod diff;
 pub mod dirdiff;
 pub mod model;
 pub mod pane;
+pub mod search;
 pub mod text;
 pub mod theme;
 pub mod ui;
