@@ -527,6 +527,9 @@ fn draw_file_status(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &
     if view.h_scroll > 0 {
         parts.push(format!("col +{}", view.h_scroll));
     }
+    if view.whitespace != crate::diff::Whitespace::Exact {
+        parts.push(format!("ws: {}", view.whitespace.label()));
+    }
     if let Some(context) = view.context {
         let hidden = view.hidden_rows();
         parts.push(if hidden > 0 {

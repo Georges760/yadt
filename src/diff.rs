@@ -4,6 +4,7 @@
 //! `DiffOp`, which is what keeps the diff algorithm swappable: replacing it means
 //! rewriting [`align_text`] and nothing else.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
@@ -23,7 +24,38 @@ pub struct DiffOptions {
     pub timeout: Duration,
     /// Compute word-level emphasis inside replace blocks.
     pub inline: bool,
+    pub whitespace: Whitespace,
 }
+
+/// How much whitespace difference counts as a difference.
+///
+/// `similar`'s own `WhitespaceMode` only applies to `diff_lines`, which re-tokenizes the
+/// text and would undo the stripped-terminator invariant this module depends on. So the
+/// normalisation happens here, on a throwaway copy used purely for comparison — the
+/// original lines are what get rendered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Whitespace {
+    #[default]
+    Exact,
+    /// Collapse runs of whitespace and ignore trailing whitespace, like `diff -b`.
+    IgnoreChanges,
+    /// Ignore whitespace entirely, like `diff -w`.
+    IgnoreAll,
+}
+
+impl Whitespace {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::IgnoreChanges => "ignore-changes",
+            Self::IgnoreAll => "ignore-all",
+        }
+    }
+}
+
+/// Two lines that word-diff below this ratio are too dissimilar for per-word emphasis to
+/// be signal rather than noise.
+const INLINE_MIN_RATIO: f32 = 0.5;
 
 impl Default for DiffOptions {
     fn default() -> Self {
@@ -33,6 +65,48 @@ impl Default for DiffOptions {
             algorithm: Algorithm::Histogram,
             timeout: DEFAULT_TIMEOUT,
             inline: true,
+            whitespace: Whitespace::Exact,
+        }
+    }
+}
+
+/// The form of a line used for *comparison*. Never rendered.
+fn normalize(line: &str, mode: Whitespace) -> Cow<'_, str> {
+    match mode {
+        Whitespace::Exact => Cow::Borrowed(line),
+        Whitespace::IgnoreAll => {
+            if line.bytes().any(|b| b.is_ascii_whitespace()) {
+                Cow::Owned(line.split_whitespace().collect())
+            } else {
+                Cow::Borrowed(line)
+            }
+        }
+        Whitespace::IgnoreChanges => {
+            // Only a line with no whitespace at all is certainly already in normal form.
+            // A single tab looks normal by count but is not a single *space*, which is
+            // what normal form means here.
+            if !line.bytes().any(|b| b.is_ascii_whitespace()) {
+                return Cow::Borrowed(line);
+            }
+            // Every run collapses to one space and trailing whitespace goes, but a run is
+            // never removed outright: GNU `diff -b` calls "  a" and "a" different, because
+            // that is a change in presence rather than in amount. Verified against
+            // `diff -b` for exactly these cases. Use `IgnoreAll` to ignore indentation.
+            let trimmed = line.trim_end();
+            let mut out = String::with_capacity(trimmed.len());
+            let mut in_run = false;
+            for c in trimmed.chars() {
+                if c.is_whitespace() {
+                    if !in_run {
+                        out.push(' ');
+                        in_run = true;
+                    }
+                } else {
+                    out.push(c);
+                    in_run = false;
+                }
+            }
+            Cow::Owned(out)
         }
     }
 }
@@ -48,9 +122,16 @@ pub fn align_text(left: &TextFile, right: &TextFile, opts: &DiffOptions) -> Alig
         return b.finish();
     }
 
-    // These must outlive `diff`, which borrows them.
+    // The lines as rendered. Emphasis offsets index these, always.
     let lo = left.slices();
     let ln = right.slices();
+
+    // The lines as compared. Identical to the above unless whitespace is being ignored,
+    // in which case comparison runs on a normalised copy that is never displayed.
+    let cmp_l: Vec<Cow<'_, str>> = lo.iter().map(|l| normalize(l, opts.whitespace)).collect();
+    let cmp_r: Vec<Cow<'_, str>> = ln.iter().map(|l| normalize(l, opts.whitespace)).collect();
+    let cmp_l: Vec<&str> = cmp_l.iter().map(Cow::as_ref).collect();
+    let cmp_r: Vec<&str> = cmp_r.iter().map(Cow::as_ref).collect();
 
     let diff = TextDiff::configure()
         .algorithm(opts.algorithm)
@@ -58,7 +139,7 @@ pub fn align_text(left: &TextFile, right: &TextFile, opts: &DiffOptions) -> Alig
         // Lines are already stripped of their terminators, so inline byte offsets are
         // offsets into exactly the `&str` the renderer draws.
         .newline_terminated(false)
-        .diff_slices(&lo, &ln);
+        .diff_slices(&cmp_l, &cmp_r);
 
     for op in diff.ops() {
         match *op {
@@ -72,11 +153,24 @@ pub fn align_text(left: &TextFile, right: &TextFile, opts: &DiffOptions) -> Alig
                 b.push_block(RowKind::Unmatched, counts(0, new_len));
             }
             DiffOp::Replace {
-                old_len, new_len, ..
+                old_index,
+                old_len,
+                new_index,
+                new_len,
             } => {
-                b.push_block(RowKind::Changed, counts(old_len, new_len));
+                let block = b.push_block(RowKind::Changed, counts(old_len, new_len));
                 if opts.inline {
-                    apply_inline(&mut b, &diff, op);
+                    // Emphasise the rows that actually got paired, using the *original*
+                    // lines -- so the highlight lines up with what is drawn, whatever the
+                    // whitespace mode did to the comparison.
+                    for k in 0..old_len.min(new_len) {
+                        emphasize(
+                            &mut b,
+                            block.start + k as u32,
+                            lo[old_index + k],
+                            ln[new_index + k],
+                        );
+                    }
                 }
             }
         }
@@ -92,37 +186,44 @@ fn counts(old_len: usize, new_len: usize) -> [u32; MAX_SIDES] {
     c
 }
 
-/// Attach word-level emphasis to the rows of one replace block.
+/// Mark the words that differ between one pair of lines.
 ///
-/// Rows are located with `AlignmentBuilder::row_of` rather than by arithmetic on
-/// `old_index + k`, so this stays correct whatever pairing policy the block used.
-fn apply_inline(b: &mut AlignmentBuilder, diff: &TextDiff<'_, '_, str>, op: &DiffOp) {
-    for change in diff.iter_inline_changes(op) {
-        let (side, index) = match change.tag() {
-            ChangeTag::Delete => (SideIdx::LEFT, change.old_index()),
-            ChangeTag::Insert => (SideIdx::RIGHT, change.new_index()),
-            ChangeTag::Equal => continue,
-        };
-        let Some(index) = index else { continue };
-        let Some(row) = b.row_of(side, index as u32) else {
-            continue;
-        };
-
-        // `values()` are the line's segments in order, so a running byte offset over them
-        // is the offset into the line itself.
-        let mut off = 0u32;
-        let ranges: Vec<(u32, u32)> = change
-            .values()
-            .iter()
-            .filter_map(|&(emphasized, value)| {
-                let start = off;
-                off += value.len() as u32;
-                emphasized.then_some((start, off))
-            })
-            .collect();
-
-        b.set_emphasis(row, side, ranges);
+/// Word-diffing the pair directly, rather than using `iter_inline_changes` over the whole
+/// replace block, has two advantages: the offsets index the original lines by
+/// construction, so they survive whitespace normalisation; and the emphasis matches the
+/// rows as actually paired for display.
+fn emphasize(b: &mut AlignmentBuilder, row: u32, left: &str, right: &str) {
+    if left == right {
+        return;
     }
+    let words = TextDiff::configure().diff_unicode_words(left, right);
+    // Two wholly unrelated lines highlight almost every word, which is noise. Leave the
+    // row plainly marked as changed instead.
+    if words.ratio() < INLINE_MIN_RATIO {
+        return;
+    }
+
+    let (mut left_at, mut right_at) = (0u32, 0u32);
+    let (mut left_spans, mut right_spans) = (Vec::new(), Vec::new());
+    for change in words.iter_all_changes() {
+        let len = change.value().len() as u32;
+        match change.tag() {
+            ChangeTag::Equal => {
+                left_at += len;
+                right_at += len;
+            }
+            ChangeTag::Delete => {
+                left_spans.push((left_at, left_at + len));
+                left_at += len;
+            }
+            ChangeTag::Insert => {
+                right_spans.push((right_at, right_at + len));
+                right_at += len;
+            }
+        }
+    }
+    b.set_emphasis(row, SideIdx::LEFT, left_spans);
+    b.set_emphasis(row, SideIdx::RIGHT, right_spans);
 }
 
 /// The result of comparing one pair of paths.
@@ -170,7 +271,19 @@ pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions)
             let eol_mismatch = lt.eol != rt.eol && lt.line_count() > 0 && rt.line_count() > 0;
             let newline_mismatch = lt.final_newline != rt.final_newline;
 
-            let note = if eol_mismatch {
+            // Ignoring whitespace can make files that plainly differ align as equal. That is
+            // the point of the flag -- `diff -w` exits 0 too -- but say so rather than
+            // leaving it looking like the files match byte for byte.
+            let whitespace_only = opts.whitespace != Whitespace::Exact
+                && alignment.is_identical()
+                && lt.text != rt.text;
+
+            let note = if whitespace_only {
+                Some(format!(
+                    "identical apart from whitespace ({})",
+                    opts.whitespace.label()
+                ))
+            } else if eol_mismatch {
                 Some(format!(
                     "line endings differ: {} vs {}",
                     lt.eol.label(),
@@ -441,5 +554,144 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KiB");
         assert_eq!(human_size(64 * 1024 * 1024), "64.0 MiB");
+    }
+}
+
+#[cfg(test)]
+mod whitespace_tests {
+    use super::*;
+    use crate::model::SideIdx;
+    use crate::text::decode;
+    use std::path::Path;
+
+    fn file(body: &str) -> TextFile {
+        decode(Path::new("test"), body.as_bytes().to_vec(), None)
+    }
+
+    fn opts(whitespace: Whitespace) -> DiffOptions {
+        DiffOptions {
+            whitespace,
+            ..DiffOptions::default()
+        }
+    }
+
+    fn identical(left: &str, right: &str, whitespace: Whitespace) -> bool {
+        align_text(&file(left), &file(right), &opts(whitespace)).is_identical()
+    }
+
+    #[test]
+    fn exact_mode_sees_every_whitespace_difference() {
+        assert!(!identical("a  b\n", "a b\n", Whitespace::Exact));
+        assert!(!identical("a b \n", "a b\n", Whitespace::Exact));
+        assert!(!identical("  a\n", "a\n", Whitespace::Exact));
+    }
+
+    #[test]
+    fn ignore_changes_collapses_runs_and_drops_trailing_space() {
+        assert!(identical("a  b\n", "a b\n", Whitespace::IgnoreChanges));
+        assert!(identical("a b   \n", "a b\n", Whitespace::IgnoreChanges));
+        assert!(identical("a\tb\n", "a b\n", Whitespace::IgnoreChanges));
+        // Amount ignored, presence not -- matching GNU `diff -b`, verified against it.
+        assert!(identical("  a\n", "    a\n", Whitespace::IgnoreChanges));
+        assert!(!identical("  a\n", "a\n", Whitespace::IgnoreChanges));
+        // A real difference is still a difference.
+        assert!(!identical("a b\n", "a c\n", Whitespace::IgnoreChanges));
+        // Whitespace between words cannot vanish entirely: "ab" is not "a b".
+        assert!(!identical("ab\n", "a b\n", Whitespace::IgnoreChanges));
+    }
+
+    #[test]
+    fn ignore_all_removes_whitespace_entirely() {
+        assert!(identical("ab\n", "a b\n", Whitespace::IgnoreAll));
+        assert!(identical("  a\tb  \n", "ab\n", Whitespace::IgnoreAll));
+        assert!(!identical("ab\n", "ac\n", Whitespace::IgnoreAll));
+    }
+
+    #[test]
+    fn reindentation_needs_ignore_all_not_ignore_changes() {
+        // Indenting a previously-unindented line adds whitespace where there was none,
+        // which `diff -b` treats as a difference. Only `-w` hides it, and yadt agrees.
+        let left = "fn main() {\nprintln!();\n}\n";
+        let right = "fn main() {\n    println!();\n}\n";
+        assert!(!identical(left, right, Whitespace::Exact));
+        assert!(!identical(left, right, Whitespace::IgnoreChanges));
+        assert!(identical(left, right, Whitespace::IgnoreAll));
+    }
+
+    #[test]
+    fn changing_the_depth_of_existing_indentation_is_ignored_by_changes() {
+        let left = "fn main() {\n  println!();\n}\n";
+        let right = "fn main() {\n        println!();\n}\n";
+        assert!(!identical(left, right, Whitespace::Exact));
+        assert!(identical(left, right, Whitespace::IgnoreChanges));
+    }
+
+    #[test]
+    fn normalize_borrows_when_a_line_is_already_normal() {
+        // A line with no whitespace is certainly already normal, so it never allocates.
+        assert!(matches!(
+            normalize("abc", Whitespace::IgnoreChanges),
+            Cow::Borrowed(_)
+        ));
+        // A lone tab looks normal by count but is not a single space.
+        assert_eq!(normalize("a\tb", Whitespace::IgnoreChanges), "a b");
+        // A leading run collapses to one space rather than vanishing.
+        assert_eq!(normalize("    a", Whitespace::IgnoreChanges), " a");
+        assert_eq!(normalize("a   ", Whitespace::IgnoreChanges), "a");
+        assert!(matches!(
+            normalize("abc", Whitespace::IgnoreAll),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize("a  b", Whitespace::IgnoreChanges),
+            Cow::Owned(_)
+        ));
+    }
+
+    #[test]
+    fn a_whitespace_only_difference_is_reported_rather_than_hidden() {
+        let cmp = compare_loaded(
+            FileContent::Text(Box::new(file("a  b\n"))),
+            FileContent::Text(Box::new(file("a b\n"))),
+            &opts(Whitespace::IgnoreChanges),
+        );
+        // Like `diff -w`, the verdict is "same"...
+        assert!(!cmp.differ);
+        // ...but the reason is on screen, not silently swallowed.
+        assert_eq!(
+            cmp.note.as_deref(),
+            Some("identical apart from whitespace (ignore-changes)")
+        );
+    }
+
+    #[test]
+    fn truly_identical_files_get_no_whitespace_note() {
+        let cmp = compare_loaded(
+            FileContent::Text(Box::new(file("a b\n"))),
+            FileContent::Text(Box::new(file("a b\n"))),
+            &opts(Whitespace::IgnoreChanges),
+        );
+        assert!(!cmp.differ);
+        assert_eq!(cmp.note, None);
+    }
+
+    #[test]
+    fn emphasis_offsets_index_the_original_line_not_the_normalised_one() {
+        // The left line has extra interior spacing, so normalisation shortens it. If
+        // emphasis were computed on the normalised text the offsets would land short.
+        let a = align_text(
+            &file("let  x   =  alpha;\n"),
+            &file("let x = beta;\n"),
+            &opts(Whitespace::IgnoreChanges),
+        );
+        let left_line = "let  x   =  alpha;";
+        let covered: String = a
+            .emphasis(0, SideIdx::LEFT)
+            .map(|e| &left_line[e.start as usize..e.end as usize])
+            .collect();
+        assert!(
+            covered.contains("alpha"),
+            "emphasis covered {covered:?}, which is not the changed word"
+        );
     }
 }

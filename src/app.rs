@@ -50,6 +50,8 @@ pub struct FileView {
     pub rows: Vec<ViewRow>,
     /// `Some(n)` collapses equal runs, keeping `n` rows of context. `None` shows every row.
     pub context: Option<u32>,
+    /// Recorded only so the status bar can say when comparison is not exact.
+    pub whitespace: crate::diff::Whitespace,
     /// First visible view row. One value, both panes — this *is* the synchronized
     /// scrolling.
     pub top: usize,
@@ -68,10 +70,19 @@ impl FileView {
     }
 
     pub fn with_context(cmp: FileComparison, context: Option<u32>) -> Self {
+        Self::configured(cmp, context, crate::diff::Whitespace::Exact)
+    }
+
+    pub fn configured(
+        cmp: FileComparison,
+        context: Option<u32>,
+        whitespace: crate::diff::Whitespace,
+    ) -> Self {
         let mut view = Self {
             cmp,
             rows: Vec::new(),
             context,
+            whitespace,
             top: 0,
             cursor: 0,
             h_scroll: 0,
@@ -660,8 +671,11 @@ impl App {
         };
         let cmp = crate::diff::compare_files(&left, &right, max_size, &diff_opts);
         self.status.clear();
-        self.views
-            .push(View::File(Box::new(FileView::with_context(cmp, context))));
+        self.views.push(View::File(Box::new(FileView::configured(
+            cmp,
+            context,
+            diff_opts.whitespace,
+        ))));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {

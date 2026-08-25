@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 use similar::Algorithm;
 
 use yadt::app::Options;
-use yadt::diff::{DEFAULT_TIMEOUT, DiffOptions};
+use yadt::diff::{DEFAULT_TIMEOUT, DiffOptions, Whitespace};
 use yadt::text::DEFAULT_MAX_FILE_SIZE;
 use yadt::{App, Theme, app, exit, resolve_inputs};
 
@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long)]
     follow_symlinks: bool,
 
+    /// Treat whitespace-only differences as equal.
+    #[arg(short = 'w', long, value_enum, default_value_t = WhitespaceArg::Exact)]
+    ignore_whitespace: WhitespaceArg,
+
     /// Skip word-level highlighting inside changed lines.
     #[arg(long)]
     no_inline: bool,
@@ -54,6 +58,27 @@ struct Cli {
     /// Disable colour output.
     #[arg(long)]
     no_color: bool,
+}
+
+/// Mirrors `diff`: `-w` ignores all whitespace, `-b` ignores changes in it.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum WhitespaceArg {
+    /// Compare whitespace exactly.
+    Exact,
+    /// Ignore changes in the amount of whitespace.
+    Changes,
+    /// Ignore whitespace entirely.
+    All,
+}
+
+impl From<WhitespaceArg> for Whitespace {
+    fn from(value: WhitespaceArg) -> Self {
+        match value {
+            WhitespaceArg::Exact => Self::Exact,
+            WhitespaceArg::Changes => Self::IgnoreChanges,
+            WhitespaceArg::All => Self::IgnoreAll,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -93,6 +118,7 @@ fn run() -> Result<i32> {
             algorithm: cli.algorithm.into(),
             timeout: DEFAULT_TIMEOUT,
             inline: !cli.no_inline,
+            whitespace: cli.ignore_whitespace.into(),
         },
         tab_width: cli.tab_width,
         max_file_size: cli.max_file_size.saturating_mul(1024 * 1024),

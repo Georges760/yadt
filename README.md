@@ -85,6 +85,7 @@ directory on one side and a file on the other; `↻` is a symlink cycle.
 | Flag | |
 |---|---|
 | `-C, --context N` | collapse identical runs, keeping `N` lines of context |
+| `-w, --ignore-whitespace` | `exact` (default), `changes` (like `diff -b`), `all` (like `diff -w`) |
 | `--algorithm` | `histogram` (default), `myers`, `patience`, `lcs` |
 | `--tab-width N` | columns per tab stop (default 8) |
 | `--max-file-size N` | refuse files larger than `N` MiB (default 64) |
@@ -98,6 +99,12 @@ Exit codes follow `diff(1)`: **0** identical, **1** differences found, **2** err
 
 ## Behaviour worth knowing
 
+- **Whitespace.** `-w changes` matches GNU `diff -b`: a run of whitespace compares equal
+  to any other run, and trailing whitespace is ignored, but whitespace appearing where
+  there was none is still a difference. To ignore indentation added to a previously
+  unindented line, use `-w all`, which matches `diff -w`. Both were checked case by case
+  against GNU diff. Comparison runs on a normalised copy; what you see is always the
+  original text, and word-level highlighting still points at the real bytes.
 - **Line endings.** Terminators are stripped before diffing, so a CRLF file and its LF twin
   align as fully equal. yadt detects that separately and says
   `line endings differ: CRLF vs LF` rather than claiming the files match.
