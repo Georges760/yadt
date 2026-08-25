@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_FILE_SIZE / (1024 * 1024))]
     max_file_size: u64,
 
+    /// Bytes per row when comparing two binaries as hex.
+    #[arg(long, value_name = "N", default_value_t = yadt::hex::DEFAULT_BYTES_PER_ROW, value_parser = clap::value_parser!(u32).range(1..=64))]
+    hex_width: u32,
+
     /// Collapse runs of identical lines, keeping this many for context.
     #[arg(short = 'C', long, value_name = "N")]
     context: Option<u32>,
@@ -119,6 +123,7 @@ fn run() -> Result<i32> {
             timeout: DEFAULT_TIMEOUT,
             inline: !cli.no_inline,
             whitespace: cli.ignore_whitespace.into(),
+            hex_bytes_per_row: cli.hex_width,
         },
         tab_width: cli.tab_width,
         max_file_size: cli.max_file_size.saturating_mul(1024 * 1024),

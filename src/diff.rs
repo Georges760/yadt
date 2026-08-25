@@ -10,7 +10,7 @@ use std::time::Duration;
 use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
 
 use crate::model::{Alignment, AlignmentBuilder, MAX_SIDES, RowKind, SideIdx};
-use crate::text::{EolStyle, FileContent, TextFile, files_equal};
+use crate::text::{BinaryReason, EolStyle, FileContent, TextFile, files_equal};
 
 /// Default ceiling on the diff computation.
 ///
@@ -25,6 +25,8 @@ pub struct DiffOptions {
     /// Compute word-level emphasis inside replace blocks.
     pub inline: bool,
     pub whitespace: Whitespace,
+    /// Bytes per row when two binaries are compared as hex.
+    pub hex_bytes_per_row: u32,
 }
 
 /// How much whitespace difference counts as a difference.
@@ -66,6 +68,7 @@ impl Default for DiffOptions {
             timeout: DEFAULT_TIMEOUT,
             inline: true,
             whitespace: Whitespace::Exact,
+            hex_bytes_per_row: crate::hex::DEFAULT_BYTES_PER_ROW,
         }
     }
 }
@@ -235,6 +238,8 @@ pub struct FileComparison {
     pub alignment: Option<Alignment>,
     /// Banner text for anything the alignment cannot express on its own.
     pub note: Option<String>,
+    /// `Some(bytes_per_row)` when the alignment is over bytes rather than lines.
+    pub hex: Option<u32>,
     pub differ: bool,
     /// A side could not be read or was refused, so the comparison is not authoritative.
     pub failed: bool,
@@ -261,6 +266,23 @@ pub fn compare_files(
 
 /// Compare two already-loaded sides.
 pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions) -> FileComparison {
+    // Two binaries get a hex diff rather than a bare "they differ": the whole point of
+    // opening one is to see *where*.
+    if let (Some(lb), Some(rb)) = (left.as_binary(), right.as_binary()) {
+        let alignment = crate::hex::align_bytes(lb, rb, opts.hex_bytes_per_row);
+        let differ = lb != rb;
+        let note = describe_binary(&left, &right);
+        return FileComparison {
+            left,
+            right,
+            alignment: Some(alignment),
+            note,
+            differ,
+            failed: false,
+            hex: Some(opts.hex_bytes_per_row.max(1)),
+        };
+    }
+
     match (left.as_text(), right.as_text()) {
         (Some(lt), Some(rt)) => {
             let alignment = align_text(lt, rt, opts);
@@ -303,6 +325,7 @@ pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions)
                 note,
                 differ,
                 failed: false,
+                hex: None,
             }
         }
         _ => {
@@ -332,8 +355,33 @@ pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions)
                 note: Some(note),
                 differ,
                 failed,
+                hex: None,
             }
         }
+    }
+}
+
+/// Why these two are being shown as hex, when the reason is not simply "both binary".
+fn describe_binary(left: &FileContent, right: &FileContent) -> Option<String> {
+    let bom = |c: &FileContent| match c {
+        FileContent::Binary {
+            reason: BinaryReason::Bom(bom),
+            ..
+        } => Some(bom.label()),
+        _ => None,
+    };
+    match (bom(left), bom(right)) {
+        (None, None) => None,
+        (l, r) => Some(format!(
+            "{} -- shown as hex, not decoded",
+            match (l, r) {
+                (Some(l), Some(r)) if l == r => l.to_string(),
+                (Some(l), Some(r)) => format!("left {l}, right {r}"),
+                (Some(l), None) => format!("left {l}"),
+                (None, Some(r)) => format!("right {r}"),
+                (None, None) => unreachable!(),
+            }
+        )),
     }
 }
 

@@ -148,6 +148,9 @@ pub enum FileContent {
         path: PathBuf,
         size: u64,
         reason: BinaryReason,
+        /// Kept so the file can be shown as hex. Bounded by `--max-file-size`, the same
+        /// guard that bounds a text file's decoded contents.
+        bytes: Vec<u8>,
     },
     TooLarge {
         path: PathBuf,
@@ -162,6 +165,14 @@ pub enum FileContent {
 }
 
 impl FileContent {
+    /// The raw bytes of a binary side, for the hex view.
+    pub fn as_binary(&self) -> Option<&[u8]> {
+        match self {
+            Self::Binary { bytes, .. } => Some(bytes),
+            _ => None,
+        }
+    }
+
     pub fn as_text(&self) -> Option<&TextFile> {
         match self {
             Self::Text(t) => Some(t),
@@ -320,6 +331,7 @@ pub fn load(path: &Path, max_size: u64) -> FileContent {
             path: path.to_path_buf(),
             size: bytes.len() as u64,
             reason,
+            bytes,
         },
         Sniff::Text { bom } => FileContent::Text(Box::new(decode(path, bytes, bom))),
     }

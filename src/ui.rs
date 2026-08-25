@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, DirView, FileView, View};
 use crate::diff::human_size;
 use crate::dirdiff::{EntryKind, EntryStatus};
+use crate::hex;
 use crate::model::{Cell, RowKind, SideIdx};
 use crate::pane::DiffPane;
 use crate::text::{FileContent, TextFile};
@@ -374,10 +375,15 @@ fn draw_file_body(
         draw_not_diffable(frame, area, view, theme);
         return;
     };
-    let Some((left_text, right_text)) = view.cmp.texts() else {
+    let text_sides = view.cmp.texts();
+    let hex_sides = view
+        .cmp
+        .hex
+        .zip(view.cmp.left.as_binary().zip(view.cmp.right.as_binary()));
+    if text_sides.is_none() && hex_sides.is_none() {
         draw_not_diffable(frame, area, view, theme);
         return;
-    };
+    }
 
     // A banner steals one row off the top when there is something the rows cannot say.
     let (banner, body) = match &view.cmp.note {
@@ -395,28 +401,55 @@ fn draw_file_body(
 
     let [left, marker, right] = pane_columns(body);
 
-    let pane = |text: &TextFile, side: SideIdx, area: Rect, frame: &mut Frame<'_>| {
-        frame.render_widget(
-            DiffPane {
-                alignment,
-                rows: &view.rows,
-                matches: view.search.as_ref().map_or(&[][..], |s| &s.matches),
-                current_match: view.search.as_ref().and_then(|s| s.current_match()),
-                text,
-                side,
-                top: view.top,
-                cursor: view.cursor,
-                h_scroll: view.h_scroll,
-                gutter_width: gutter_width(text),
-                tab_width,
-                theme,
-                focused: view.focus == side,
-            },
-            area,
-        );
-    };
-    pane(left_text, SideIdx::LEFT, left, frame);
-    pane(right_text, SideIdx::RIGHT, right, frame);
+    if let Some((per_row, (left_bytes, right_bytes))) = hex_sides {
+        // A hex row is a chunk of bytes rather than a line, but the row bookkeeping,
+        // cursor and marker column are the same — that is the point of aligning bytes with
+        // the same machinery as lines.
+        let gutter = hex::gutter_width(left_bytes.len().max(right_bytes.len()) as u64);
+        let hex_pane = |bytes: &[u8], side: SideIdx, area: Rect, frame: &mut Frame<'_>| {
+            frame.render_widget(
+                hex::HexPane {
+                    alignment,
+                    rows: &view.rows,
+                    bytes,
+                    side,
+                    top: view.top,
+                    cursor: view.cursor,
+                    h_scroll: view.h_scroll,
+                    gutter_width: gutter,
+                    per_row,
+                    theme,
+                    focused: view.focus == side,
+                },
+                area,
+            );
+        };
+        hex_pane(left_bytes, SideIdx::LEFT, left, frame);
+        hex_pane(right_bytes, SideIdx::RIGHT, right, frame);
+    } else if let Some((left_text, right_text)) = text_sides {
+        let pane = |text: &TextFile, side: SideIdx, area: Rect, frame: &mut Frame<'_>| {
+            frame.render_widget(
+                DiffPane {
+                    alignment,
+                    rows: &view.rows,
+                    matches: view.search.as_ref().map_or(&[][..], |s| &s.matches),
+                    current_match: view.search.as_ref().and_then(|s| s.current_match()),
+                    text,
+                    side,
+                    top: view.top,
+                    cursor: view.cursor,
+                    h_scroll: view.h_scroll,
+                    gutter_width: gutter_width(text),
+                    tab_width,
+                    theme,
+                    focused: view.focus == side,
+                },
+                area,
+            );
+        };
+        pane(left_text, SideIdx::LEFT, left, frame);
+        pane(right_text, SideIdx::RIGHT, right, frame);
+    }
 
     draw_markers(frame, marker, view, theme);
 }
@@ -524,16 +557,20 @@ fn draw_file_status(
     }
     if let Some(alignment) = view.cmp.alignment.as_ref() {
         let anchor = view.cursor_row().unwrap_or(0) as usize;
-        let line_at = |side: SideIdx| match alignment.cell(anchor, side) {
+        // A hex row is a chunk of bytes, so the useful position there is its offset rather
+        // than a line number.
+        let at = |side: SideIdx| match alignment.cell(anchor, side) {
             _ if view.cursor_is_fold() => "\u{22ef}".to_string(),
-            Cell::Line(n) => n.display().to_string(),
+            Cell::Line(n) => match view.cmp.hex {
+                Some(per_row) => format!("{:#x}", hex::row_offset(n.0, per_row)),
+                None => n.display().to_string(),
+            },
             Cell::Filler => "-".to_string(),
         };
-        parts.push(format!(
-            "L:{} R:{}",
-            line_at(SideIdx::LEFT),
-            line_at(SideIdx::RIGHT)
-        ));
+        parts.push(match view.cmp.hex {
+            Some(_) => format!("L@{} R@{}", at(SideIdx::LEFT), at(SideIdx::RIGHT)),
+            None => format!("L:{} R:{}", at(SideIdx::LEFT), at(SideIdx::RIGHT)),
+        });
 
         let stats = alignment.stats();
         if alignment.is_identical() && !view.cmp.differ {
@@ -784,6 +821,7 @@ mod render_tests {
                 path: "b.bin".into(),
                 size: 2048,
                 reason: crate::text::BinaryReason::Nul,
+                bytes: vec![0; 2048],
             },
         );
         let lines = frame(&mut app, 46, 12);
@@ -1159,5 +1197,181 @@ mod cursor_tests {
             equal_selected, changed_selected,
             "a selected changed row must not look like a selected equal row"
         );
+    }
+}
+
+#[cfg(test)]
+mod hex_render_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    use crate::app::{App, Options, View};
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{BinaryReason, FileContent};
+    use crate::theme::Theme;
+    use crate::{Inputs, app};
+
+    fn binary(name: &str, bytes: &[u8]) -> FileContent {
+        FileContent::Binary {
+            path: name.into(),
+            size: bytes.len() as u64,
+            reason: BinaryReason::Nul,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn hex_app(left: &[u8], right: &[u8], per_row: u32) -> App {
+        let opts = Options {
+            diff: DiffOptions {
+                hex_bytes_per_row: per_row,
+                ..DiffOptions::default()
+            },
+            tab_width: 8,
+            max_file_size: u64::MAX,
+            follow_symlinks: false,
+            context: None,
+        };
+        let cmp = compare_loaded(binary("a.bin", left), binary("b.bin", right), &opts.diff);
+        let mut app = App::new(
+            Inputs::Dirs {
+                left: std::env::temp_dir(),
+                right: std::env::temp_dir(),
+            },
+            opts,
+            Theme::dark(),
+        )
+        .expect("temp dir exists");
+        app.views = vec![View::File(Box::new(app::FileView::new(cmp)))];
+        app
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| super::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (lines, buffer)
+    }
+
+    #[test]
+    fn two_binaries_render_as_side_by_side_hex() {
+        let mut app = hex_app(b"AB\x00\xffZZ", b"AB\x00\xffYY", 4);
+        let (lines, _) = render(&mut app, 66, 6);
+
+        assert_eq!(lines[0], "a.bin                              b.bin");
+        // Offset gutter in hex, then the bytes, then the printable-ASCII pane. The short
+        // final row is padded so both sides stay column-aligned.
+        assert_eq!(
+            lines[1],
+            "0000 41 42 00 ff  |AB..|           0000 41 42 00 ff  |AB..|"
+        );
+        assert_eq!(
+            lines[2],
+            "0004 5a 5a        |ZZ  |         \u{25ac} 0004 59 59        |YY  |"
+        );
+    }
+
+    #[test]
+    fn only_the_differing_bytes_are_emphasised() {
+        // Byte 1 of the second row differs; byte 0 does not.
+        let mut app = hex_app(b"abcdXY", b"abcdXZ", 4);
+        let (lines, buf) = render(&mut app, 66, 5);
+        assert_eq!(
+            lines[2],
+            "0004 58 59        |XY  |         \u{25ac} 0004 58 5a        |XZ  |"
+        );
+
+        // The left pane starts at column 0; gutter is 4 wide plus a space, so the hex
+        // area begins at column 5. Byte 0 is columns 5..7, byte 1 is 8..10.
+        let bg = |x: u16| buf.cell((x, 2)).unwrap().style().bg;
+        let row_bg = bg(5);
+        assert_eq!(bg(6), row_bg, "byte 0 matches, so it keeps the row colour");
+        assert_ne!(bg(8), row_bg, "byte 1 differs and must stand out");
+        assert_ne!(bg(9), row_bg);
+    }
+
+    #[test]
+    fn the_ascii_column_is_emphasised_too() {
+        let mut app = hex_app(b"abcdXY", b"abcdXZ", 4);
+        let (lines, buf) = render(&mut app, 66, 5);
+        // Find the 'Y' in the left pane's ascii block on row 2.
+        let y_col = lines[2].find('Y').unwrap() as u16;
+        let bg = |x: u16| buf.cell((x, 2)).unwrap().style().bg;
+        assert_ne!(
+            bg(y_col),
+            bg(y_col - 1),
+            "the changed ascii character stands out"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_drops_the_ascii_block_rather_than_truncating_hex() {
+        let mut app = hex_app(b"abcdefgh", b"abcdefgh", 4);
+        let (lines, _) = render(&mut app, 40, 5);
+        assert!(
+            !lines[1].contains('|'),
+            "ascii should be dropped: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("61 62 63 64"),
+            "hex must survive: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn a_longer_file_shows_its_tail_against_an_empty_pane() {
+        let mut app = hex_app(b"abcdefgh", b"abcd", 4);
+        let (lines, _) = render(&mut app, 66, 5);
+        // Row 1 exists only on the left.
+        assert!(lines[2].starts_with("0004 65 66 67 68"), "{:?}", lines[2]);
+        assert!(lines[2].trim_end().ends_with('\u{25c0}'), "{:?}", lines[2]);
+    }
+
+    #[test]
+    fn identical_binaries_show_no_markers() {
+        let mut app = hex_app(b"same", b"same", 4);
+        let (lines, _) = render(&mut app, 66, 4);
+        assert!(!lines[1].contains('\u{25ac}'));
+        assert!(lines.last().unwrap().contains("identical"));
+    }
+
+    #[test]
+    fn a_long_identical_run_folds_in_hex_too() {
+        // Folding is a view transform over the alignment, so it works on bytes unchanged.
+        let mut left = vec![0u8; 400];
+        left[0] = 1;
+        let mut right = left.clone();
+        right[0] = 2;
+
+        let mut app = hex_app(&left, &right, 4);
+        app.active_file().unwrap().context = Some(1);
+        // Rebuild through the public toggle path.
+        app.active_file().unwrap().toggle_fold();
+        app.active_file().unwrap().toggle_fold();
+
+        let (lines, _) = render(&mut app, 66, 8);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("identical bytes"),
+            "expected a fold summary in bytes, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_tiny_terminal_does_not_panic() {
+        let mut app = hex_app(b"abcd", b"abce", 4);
+        let _ = render(&mut app, 6, 3);
+        let _ = render(&mut app, 1, 1);
     }
 }

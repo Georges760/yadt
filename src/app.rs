@@ -871,6 +871,12 @@ impl App {
 
     fn handle_file_key(&mut self, key: KeyEvent, ctrl: bool) {
         if key.code == KeyCode::Char('/') {
+            // Search reads line text, which a hex comparison does not have. Say so rather
+            // than opening a prompt that could never match anything.
+            if self.active_file().is_some_and(|v| v.cmp.hex.is_some()) {
+                self.status = "search is not available in the hex view".to_string();
+                return;
+            }
             self.prompt = Some(Prompt {
                 label: "/",
                 buffer: String::new(),
@@ -1340,6 +1346,7 @@ mod fold_view_tests {
                 path: "b".into(),
                 size: 1,
                 reason: crate::text::BinaryReason::Nul,
+                bytes: vec![0],
             },
             &DiffOptions::default(),
         );
@@ -1565,5 +1572,123 @@ mod search_view_tests {
             Some(1),
             "n should still jump to the hunk"
         );
+    }
+}
+
+#[cfg(test)]
+mod hex_view_tests {
+    use super::*;
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{BinaryReason, FileContent};
+    use crossterm::event::KeyModifiers;
+
+    fn binary(bytes: &[u8]) -> FileContent {
+        FileContent::Binary {
+            path: "b".into(),
+            size: bytes.len() as u64,
+            reason: BinaryReason::Nul,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn hex_view(left: &[u8], right: &[u8]) -> FileView {
+        let opts = DiffOptions {
+            hex_bytes_per_row: 4,
+            ..DiffOptions::default()
+        };
+        let cmp = compare_loaded(binary(left), binary(right), &opts);
+        let mut v = FileView::with_context(cmp, None);
+        v.viewport = 10;
+        v
+    }
+
+    fn app_with(view: FileView) -> App {
+        App {
+            views: vec![View::File(Box::new(view))],
+            opts: Options {
+                diff: DiffOptions::default(),
+                tab_width: 8,
+                max_file_size: u64::MAX,
+                follow_symlinks: false,
+                context: None,
+            },
+            theme: Theme::no_color(),
+            prompt: None,
+            help_visible: false,
+            status: String::new(),
+            should_quit: false,
+            exit_code: 0,
+        }
+    }
+
+    #[test]
+    fn two_binaries_get_a_hex_comparison_rather_than_a_bare_verdict() {
+        let v = hex_view(b"abcdefgh", b"abcdXfgh");
+        assert_eq!(v.cmp.hex, Some(4));
+        assert!(v.cmp.alignment.is_some(), "hex still produces an alignment");
+        assert!(v.cmp.differ);
+        assert!(!v.cmp.failed);
+        assert_eq!(v.row_count(), 2);
+    }
+
+    #[test]
+    fn identical_binaries_report_no_difference() {
+        let v = hex_view(b"same bytes", b"same bytes");
+        assert!(!v.cmp.differ);
+        assert!(v.cmp.alignment.as_ref().unwrap().is_identical());
+    }
+
+    #[test]
+    fn hunk_navigation_works_over_bytes() {
+        // Differ in the first and last chunk, match in between.
+        let v_left = b"XXXX....++++";
+        let v_right = b"YYYY....----";
+        let mut v = hex_view(v_left, v_right);
+        assert_eq!(v.cmp.alignment.as_ref().unwrap().hunks().len(), 2);
+
+        v.cursor = 0;
+        v.goto_hunk(true);
+        assert_eq!(v.cursor_row(), Some(2), "n should reach the second hunk");
+    }
+
+    #[test]
+    fn a_text_file_against_a_binary_is_still_not_comparable() {
+        let text = FileContent::Text(Box::new(crate::text::decode(
+            std::path::Path::new("t"),
+            b"hello\n".to_vec(),
+            None,
+        )));
+        let cmp = compare_loaded(text, binary(b"\x00\x01"), &DiffOptions::default());
+        assert_eq!(cmp.hex, None, "a hex view needs bytes on both sides");
+        assert!(cmp.alignment.is_none());
+    }
+
+    #[test]
+    fn search_is_refused_in_the_hex_view_rather_than_silently_failing() {
+        let mut app = app_with(hex_view(b"abcd", b"abcX"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.prompt.is_none(), "no prompt should open");
+        assert!(
+            app.status.contains("not available"),
+            "status was {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn folding_still_works_in_the_hex_view() {
+        let mut left = vec![0u8; 200];
+        left[0] = 1;
+        let mut right = left.clone();
+        right[0] = 2;
+        let mut v = hex_view(&left, &right);
+        let unfolded = v.row_count();
+
+        v.toggle_fold();
+        assert!(
+            v.row_count() < unfolded,
+            "the identical run should collapse"
+        );
+        assert!(v.hidden_rows() > 0);
     }
 }

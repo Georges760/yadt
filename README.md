@@ -34,6 +34,16 @@ view stays readable with colour off.
 
 Both panes scroll together, because both render the same aligned row.
 
+### Hex view
+
+Two binaries open as hex, aligned by offset:
+
+```
+00000000 31 2e 34 2e 30 2d 62 65 74 61 32 2f  {25ac} 00000000 31 2e 34 2e 30 2d 62 65 74 61 33 2f
+00000010 73 2f 61 70 70 2e 62 69 6e 00 00 00    00000010 73 2f 61 70 70 2e 62 69 6e 00 00 00
+         {22ef} 1536 identical bytes            {22ef} 1536 identical bytes
+```
+
 ### Directory view
 
 ```
@@ -90,6 +100,7 @@ directory on one side and a file on the other; `↻` is a symlink cycle.
 | `-w, --ignore-whitespace` | `exact` (default), `changes` (like `diff -b`), `all` (like `diff -w`) |
 | `--algorithm` | `histogram` (default), `myers`, `patience`, `lcs` |
 | `--tab-width N` | columns per tab stop (default 8) |
+| `--hex-width N` | bytes per row when comparing two binaries (default 8) |
 | `--max-file-size N` | refuse files larger than `N` MiB (default 64) |
 | `--follow-symlinks` | follow links when comparing directories |
 | `--no-inline` | skip word-level highlighting inside changed lines |
@@ -113,9 +124,19 @@ Exit codes follow `diff(1)`: **0** identical, **1** differences found, **2** err
 - **Line endings.** Terminators are stripped before diffing, so a CRLF file and its LF twin
   align as fully equal. yadt detects that separately and says
   `line endings differ: CRLF vs LF` rather than claiming the files match.
-- **Binary files** are detected by a NUL byte in the first 8 KiB and are compared by bytes,
-  not by lines. UTF-16 is detected by its BOM and treated as binary — yadt does not decode
-  it.
+- **Binary files** are detected by a NUL byte in the first 8 KiB, and two of them open a
+  side-by-side hex view: offset gutter, hex bytes, and a printable-ASCII pane that is
+  dropped automatically when the terminal is too narrow. Only the bytes that actually
+  differ are highlighted, in both the hex and the ASCII column. `--hex-width` sets the
+  bytes per row.
+
+  Hex rows are aligned **by offset**, so a byte inserted near the start shifts everything
+  after it and every later row reads as changed. That is what `cmp` reports too. Folding
+  and hunk navigation work over bytes exactly as over lines, so a firmware image with two
+  changed fields collapses to those two hunks. Search does not work in the hex view and
+  says so rather than failing quietly.
+
+  UTF-16 is detected by its BOM and shown as hex rather than decoded.
 - **Symlinks are not followed by default**, and are compared by their target. This differs
   from GNU `diff -r`, which follows. `--follow-symlinks` opts in, and reports a link back
   to an ancestor as a cycle rather than walking it.
