@@ -100,7 +100,7 @@ directory on one side and a file on the other; `↻` is a symlink cycle.
 | `-w, --ignore-whitespace` | `exact` (default), `changes` (like `diff -b`), `all` (like `diff -w`) |
 | `--algorithm` | `histogram` (default), `myers`, `patience`, `lcs` |
 | `--tab-width N` | columns per tab stop (default 8) |
-| `--hex-width N` | bytes per row when comparing two binaries (default 8) |
+| `--hex-width N` | pin the bytes per row for a hex diff (default: fit the terminal) |
 | `--max-file-size N` | refuse files larger than `N` MiB (default 64) |
 | `--follow-symlinks` | follow links when comparing directories |
 | `--no-inline` | skip word-level highlighting inside changed lines |
@@ -134,6 +134,13 @@ Exit codes follow `diff(1)`: **0** identical, **1** differences found, **2** err
   dropped automatically when the terminal is too narrow. Only the bytes that actually
   differ are highlighted, in both the hex and the ASCII column. `--hex-width` sets the
   bytes per row.
+
+  Rows hold as many bytes as the terminal fits, in multiples of eight -- 8, 16, 24, 32 --
+  so offsets stay easy to read, and they re-fit as you resize. The step means a middling
+  width can leave slack: 16 bytes with the ASCII pane needs 67 columns per side, so around
+  140 columns you get 8 with room to spare. `--hex-width 16` pins it there and the ASCII
+  pane drops itself to make room. Above 8 MiB the width is fitted once at startup and not
+  re-fitted live, since re-aligning a large binary takes about a second.
 
   Hex rows are aligned **by offset**, so a byte inserted near the start shifts everything
   after it and every later row reads as changed. That is what `cmp` reports too. Folding

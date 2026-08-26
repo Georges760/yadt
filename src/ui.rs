@@ -39,6 +39,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     match app.views.last_mut() {
         Some(View::File(view)) => {
             view.clamp(body);
+            if view.cmp.hex.is_some() {
+                // The gutter is sized from the file, so what is left for the row is
+                // whatever the pane has after it.
+                let pane = pane_columns(body)[0];
+                let gutter = hex_gutter_width(view);
+                view.fit_hex_width(pane.width.saturating_sub(gutter + 1));
+            }
             draw_file_header(frame, header, view, &theme);
             draw_file_body(frame, body, view, &theme, tab_width);
             draw_file_status(frame, status, view, &theme, &message);
@@ -411,7 +418,7 @@ fn draw_file_body(
         // A hex row is a chunk of bytes rather than a line, but the row bookkeeping,
         // cursor and marker column are the same — that is the point of aligning bytes with
         // the same machinery as lines.
-        let gutter = hex::gutter_width(left_bytes.len().max(right_bytes.len()) as u64);
+        let gutter = hex_gutter_width(view);
         let hex_pane = |bytes: &[u8], side: SideIdx, area: Rect, frame: &mut Frame<'_>| {
             frame.render_widget(
                 hex::HexPane {
@@ -631,6 +638,18 @@ fn draw_file_status(
 ///
 /// Shown on opening and cleared by the first keystroke: two identical files render as a
 /// screen of unremarkable text, which looks the same as a diff that has not loaded.
+/// Offset-gutter width for a hex comparison. Shared by the width fit and the renderer so
+/// the two cannot disagree about how much room the row has.
+fn hex_gutter_width(view: &FileView) -> u16 {
+    let bytes = view
+        .cmp
+        .left
+        .as_binary()
+        .map_or(0, <[u8]>::len)
+        .max(view.cmp.right.as_binary().map_or(0, <[u8]>::len));
+    hex::gutter_width(bytes as u64)
+}
+
 fn draw_identical_notice(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
     // How big the thing that matched is — a line count for text, a size for bytes.
     let size = match (view.cmp.hex, view.cmp.texts()) {
@@ -815,6 +834,7 @@ mod render_tests {
             max_file_size: u64::MAX,
             follow_symlinks: false,
             context: None,
+            hex_width_pinned: false,
         };
         // Build the view directly: App::new goes through the filesystem.
         let cmp = compare_loaded(left, right, &opts.diff);
@@ -947,6 +967,7 @@ mod dir_render_tests {
             max_file_size: u64::MAX,
             follow_symlinks: false,
             context: None,
+            hex_width_pinned: false,
         };
         // Point the scan at a directory that exists but is empty of interest; the rows
         // below replace whatever it finds.
@@ -1161,6 +1182,7 @@ mod cursor_tests {
             max_file_size: u64::MAX,
             follow_symlinks: false,
             context: None,
+            hex_width_pinned: false,
         };
         let cmp = compare_loaded(content("a", left), content("b", right), &opts.diff);
         let mut app = App::new(
@@ -1298,6 +1320,9 @@ mod hex_render_tests {
             max_file_size: u64::MAX,
             follow_symlinks: false,
             context: None,
+            // These tests assert exact columns, so the row width must not be refitted to
+            // the test terminal.
+            hex_width_pinned: true,
         };
         let cmp = compare_loaded(binary("a.bin", left), binary("b.bin", right), &opts.diff);
         let mut app = App::new(
@@ -1310,8 +1335,10 @@ mod hex_render_tests {
         )
         .expect("temp dir exists");
         app.views = vec![View::File(Box::new(app::FileView::new(cmp)))];
+        let view = app.active_file().unwrap();
         // Layout tests want the panes, not the overlay that appears on identical input.
-        app.active_file().unwrap().notice = false;
+        view.notice = false;
+        view.hex_pinned = true;
         app
     }
 
@@ -1485,6 +1512,7 @@ mod notice_tests {
             max_file_size: u64::MAX,
             follow_symlinks: false,
             context: None,
+            hex_width_pinned: false,
         };
         let cmp = compare_loaded(left, right, &opts.diff);
         let mut app = App::new(

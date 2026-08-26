@@ -29,6 +29,8 @@ pub struct Options {
     pub follow_symlinks: bool,
     /// `Some(n)` starts with equal runs collapsed, keeping `n` lines of context.
     pub context: Option<u32>,
+    /// `--hex-width` was given, so the row width must not be refitted to the terminal.
+    pub hex_width_pinned: bool,
 }
 
 /// One entry on the view stack.
@@ -70,6 +72,8 @@ pub struct FileView {
     pub search: Option<SearchState>,
     /// Show the "identical" overlay until the first keystroke.
     pub notice: bool,
+    /// True when `--hex-width` pinned the row width, so it must not be refitted.
+    pub hex_pinned: bool,
     /// First visible view row. One value, both panes — this *is* the synchronized
     /// scrolling.
     pub top: usize,
@@ -111,6 +115,7 @@ impl FileView {
             // Worth saying out loud: a screen of two identical files looks exactly like a
             // screen where the diff has not loaded yet.
             notice: !cmp_differs && !cmp_failed,
+            hex_pinned: false,
         };
         view.rebuild_rows();
         view
@@ -777,11 +782,9 @@ impl App {
         };
         let cmp = crate::diff::compare_files(&left, &right, max_size, &diff_opts);
         self.status.clear();
-        self.views.push(View::File(Box::new(FileView::configured(
-            cmp,
-            context,
-            diff_opts.whitespace,
-        ))));
+        let mut view = FileView::configured(cmp, context, diff_opts.whitespace);
+        view.hex_pinned = self.opts.hex_width_pinned;
+        self.views.push(View::File(Box::new(view)));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -1410,6 +1413,7 @@ mod search_view_tests {
                 max_file_size: u64::MAX,
                 follow_symlinks: false,
                 context: None,
+                hex_width_pinned: false,
             },
             theme: Theme::no_color(),
             prompt: None,
@@ -1623,6 +1627,7 @@ mod hex_view_tests {
                 max_file_size: u64::MAX,
                 follow_symlinks: false,
                 context: None,
+                hex_width_pinned: false,
             },
             theme: Theme::no_color(),
             prompt: None,
@@ -1702,5 +1707,190 @@ mod hex_view_tests {
             "the identical run should collapse"
         );
         assert!(v.hidden_rows() > 0);
+    }
+}
+
+impl FileView {
+    /// Re-fit the hex row width to the space available, rebuilding the alignment if the
+    /// width actually changes.
+    ///
+    /// Bytes per row define the rows themselves, so this cannot be a pure render-time
+    /// decision the way dropping the ASCII pane is. It is gated on the width *bucket*
+    /// changing, so dragging a terminal edge within one bucket costs nothing, and a
+    /// pinned `--hex-width` is left alone.
+    pub fn fit_hex_width(&mut self, pane_text_width: u16) {
+        let Some(current) = self.cmp.hex else {
+            return;
+        };
+        if self.hex_pinned {
+            return;
+        }
+        let desired = crate::hex::fit_bytes_per_row(pane_text_width);
+        if desired == current {
+            return;
+        }
+        // Re-aligning a large binary takes long enough to be felt as a stall, and the
+        // startup fit already used the real terminal size.
+        let size = self
+            .cmp
+            .left
+            .as_binary()
+            .map_or(0, <[u8]>::len)
+            .max(self.cmp.right.as_binary().map_or(0, <[u8]>::len));
+        if size > crate::hex::REFIT_SIZE_LIMIT {
+            return;
+        }
+
+        // Hold the byte offset, not the row index: the same row number means a different
+        // place in the file once the width changes.
+        let offset = self
+            .cursor_row()
+            .map(|row| crate::hex::row_offset(row, current));
+
+        let alignment = {
+            let (Some(left), Some(right)) = (self.cmp.left.as_binary(), self.cmp.right.as_binary())
+            else {
+                return;
+            };
+            crate::hex::align_bytes(left, right, desired)
+        };
+        self.cmp.alignment = Some(alignment);
+        self.cmp.hex = Some(desired);
+        self.rebuild_rows();
+
+        if let Some(offset) = offset {
+            let row = (offset / u64::from(desired)) as u32;
+            if let Some(index) = model::view_index_of(&self.rows, row) {
+                self.cursor = index;
+                self.top = self.cursor.saturating_sub(self.viewport as usize / 3);
+            }
+        }
+        // A search is over line text, which a hex view has none of, but be tidy anyway.
+        self.search = None;
+    }
+}
+
+#[cfg(test)]
+mod hex_fit_tests {
+    use super::*;
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{BinaryReason, FileContent};
+
+    fn binary(bytes: &[u8]) -> FileContent {
+        FileContent::Binary {
+            path: "b".into(),
+            size: bytes.len() as u64,
+            reason: BinaryReason::Nul,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn view(len: usize, per_row: u32) -> FileView {
+        let mut left = vec![0u8; len];
+        left[0] = 1;
+        let mut right = left.clone();
+        right[len - 1] = 9;
+        let opts = DiffOptions {
+            hex_bytes_per_row: per_row,
+            ..DiffOptions::default()
+        };
+        let cmp = compare_loaded(binary(&left), binary(&right), &opts);
+        let mut v = FileView::with_context(cmp, None);
+        v.viewport = 20;
+        v
+    }
+
+    #[test]
+    fn a_wider_pane_packs_more_bytes_into_each_row() {
+        let mut v = view(256, 8);
+        assert_eq!(v.cmp.hex, Some(8));
+        let rows_at_8 = v.row_count();
+
+        v.fit_hex_width(100); // room for 24
+        assert_eq!(v.cmp.hex, Some(24));
+        assert!(v.row_count() < rows_at_8, "wider rows mean fewer of them");
+    }
+
+    #[test]
+    fn a_narrower_pane_goes_back_down() {
+        let mut v = view(256, 32);
+        v.fit_hex_width(40);
+        assert_eq!(v.cmp.hex, Some(8));
+    }
+
+    #[test]
+    fn refitting_holds_the_byte_offset_not_the_row_number() {
+        let mut v = view(256, 8);
+        // Row 10 at 8 bytes per row is byte 80.
+        v.cursor = 10;
+        assert_eq!(v.cursor_row(), Some(10));
+
+        v.fit_hex_width(100); // 24 bytes per row
+        let row = v.cursor_row().unwrap();
+        let offset = crate::hex::row_offset(row, 24);
+        assert!(
+            (offset..offset + 24).contains(&80),
+            "byte 80 should still be on screen; landed at offset {offset}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_width_rebuilds_nothing() {
+        let mut v = view(256, 8);
+        let before = v.row_count();
+        v.cursor = 5;
+        v.fit_hex_width(35); // still 8
+        assert_eq!(v.cmp.hex, Some(8));
+        assert_eq!(v.row_count(), before);
+        assert_eq!(v.cursor, 5, "an unchanged fit must not disturb the cursor");
+    }
+
+    #[test]
+    fn a_pinned_width_is_left_alone() {
+        let mut v = view(256, 8);
+        v.hex_pinned = true;
+        v.fit_hex_width(300);
+        assert_eq!(v.cmp.hex, Some(8), "--hex-width must win over the terminal");
+    }
+
+    #[test]
+    fn a_large_binary_is_not_refitted_live() {
+        // Re-aligning this would stall; the startup fit already used the real terminal.
+        let mut v = view(crate::hex::REFIT_SIZE_LIMIT + 1024, 8);
+        v.fit_hex_width(300);
+        assert_eq!(v.cmp.hex, Some(8));
+    }
+
+    #[test]
+    fn a_text_comparison_ignores_the_fit_entirely() {
+        let text = |b: &str| {
+            FileContent::Text(Box::new(crate::text::decode(
+                std::path::Path::new("t"),
+                b.as_bytes().to_vec(),
+                None,
+            )))
+        };
+        let cmp = compare_loaded(text("a\n"), text("b\n"), &DiffOptions::default());
+        let mut v = FileView::with_context(cmp, None);
+        let before = v.row_count();
+        v.fit_hex_width(300);
+        assert_eq!(v.cmp.hex, None);
+        assert_eq!(v.row_count(), before);
+    }
+
+    #[test]
+    fn the_alignment_stays_correct_after_a_refit() {
+        // The last byte differs; it must still be the one marked, at the new width.
+        let mut v = view(256, 8);
+        v.fit_hex_width(100);
+        let alignment = v.cmp.alignment.as_ref().unwrap();
+        assert!(!alignment.is_identical());
+
+        let last = alignment.len() - 1;
+        let spans: Vec<_> = alignment
+            .emphasis(last, SideIdx::LEFT)
+            .map(|e| (e.start, e.end))
+            .collect();
+        assert_eq!(spans, [(255 % 24, 255 % 24 + 1)]);
     }
 }

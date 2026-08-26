@@ -35,9 +35,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_FILE_SIZE / (1024 * 1024))]
     max_file_size: u64,
 
-    /// Bytes per row when comparing two binaries as hex.
-    #[arg(long, value_name = "N", default_value_t = yadt::hex::DEFAULT_BYTES_PER_ROW, value_parser = clap::value_parser!(u32).range(1..=64))]
-    hex_width: u32,
+    /// Bytes per row when comparing two binaries as hex. Defaults to fitting the terminal.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=64))]
+    hex_width: Option<u32>,
 
     /// Collapse runs of identical lines, keeping this many for context.
     #[arg(short = 'C', long, value_name = "N")]
@@ -123,12 +123,13 @@ fn run() -> Result<i32> {
             timeout: DEFAULT_TIMEOUT,
             inline: !cli.no_inline,
             whitespace: cli.ignore_whitespace.into(),
-            hex_bytes_per_row: cli.hex_width,
+            hex_bytes_per_row: cli.hex_width.unwrap_or_else(initial_hex_width),
         },
         tab_width: cli.tab_width,
         max_file_size: cli.max_file_size.saturating_mul(1024 * 1024),
         follow_symlinks: cli.follow_symlinks,
         context: cli.context,
+        hex_width_pinned: cli.hex_width.is_some(),
     };
 
     let theme = if cli.no_color || std::env::var_os("NO_COLOR").is_some() {
@@ -157,4 +158,17 @@ fn run() -> Result<i32> {
     ratatui::run(|terminal| app::run_app(terminal, &mut app))?;
 
     Ok(app.exit_code())
+}
+
+/// Bytes per hex row for the terminal as it is right now.
+///
+/// Done before the alternate screen is entered and before the files are read, so a large
+/// binary is aligned at the right width once rather than being re-aligned on the first
+/// draw. Falls back to the default if the size cannot be determined — output may be piped.
+fn initial_hex_width() -> u32 {
+    crossterm::terminal::size().map_or(yadt::hex::DEFAULT_BYTES_PER_ROW, |(cols, _)| {
+        // A generous gutter guess: being one step conservative costs less than being wrong
+        // the other way, and small files get corrected at draw time anyway.
+        yadt::hex::fit_bytes_per_row(yadt::hex::pane_row_width(cols, 8))
+    })
 }

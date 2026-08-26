@@ -17,6 +17,39 @@ use crate::pane::Overlay;
 /// classic `hexdump -C` width and wants a wide one.
 pub const DEFAULT_BYTES_PER_ROW: u32 = 8;
 
+/// Rows are always a multiple of this, so offsets stay easy to read across widths.
+pub const BYTES_PER_ROW_STEP: u32 = 8;
+
+/// Beyond this a row is unreadable however wide the terminal is.
+pub const MAX_BYTES_PER_ROW: u32 = 64;
+
+/// Rows are only re-fitted live below this size. Above it the initial fit from the
+/// terminal size stands, because re-aligning a large file takes long enough to feel.
+pub const REFIT_SIZE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Columns a pane leaves for the row itself, given the whole terminal width.
+///
+/// Used before the files are loaded, so it assumes the widest gutter it is likely to
+/// need; the draw-time fit corrects it for anything small enough to re-align.
+pub fn pane_row_width(terminal_width: u16, gutter: u16) -> u16 {
+    // Two panes plus the three-column marker between them.
+    terminal_width
+        .saturating_sub(3)
+        .saturating_div(2)
+        .saturating_sub(gutter + 1)
+}
+
+/// The widest multiple of [`BYTES_PER_ROW_STEP`] whose row fits `available` columns.
+///
+/// Sized for the layout that keeps the ASCII pane -- `4n + 3` columns -- so widening the
+/// terminal adds bytes rather than trailing space. When even the narrowest row will not
+/// fit, the floor is returned and [`Layout::for_width`] drops the ASCII pane at render
+/// time instead.
+pub fn fit_bytes_per_row(available: u16) -> u32 {
+    let fits = (available as u32).saturating_sub(3) / 4;
+    (fits / BYTES_PER_ROW_STEP * BYTES_PER_ROW_STEP).clamp(BYTES_PER_ROW_STEP, MAX_BYTES_PER_ROW)
+}
+
 /// Build an alignment over two byte slices, one row per chunk.
 ///
 /// Rows where both sides have bytes are `Equal` or `Changed`; past the end of the shorter
@@ -505,6 +538,66 @@ mod tests {
             ascii: false,
         };
         assert!(overlays([(9, 10)].into_iter(), layout, Style::new()).is_empty());
+    }
+
+    #[test]
+    fn the_row_width_grows_in_steps_of_eight() {
+        // Whatever the terminal, a row is a multiple of eight so offsets stay readable.
+        for available in 0..400u16 {
+            let n = fit_bytes_per_row(available);
+            assert_eq!(n % BYTES_PER_ROW_STEP, 0, "{available} columns gave {n}");
+            assert!((BYTES_PER_ROW_STEP..=MAX_BYTES_PER_ROW).contains(&n));
+        }
+    }
+
+    #[test]
+    fn the_fitted_row_actually_fits() {
+        // Above the floor, the chosen width must leave the ascii pane intact.
+        for available in 35..400u16 {
+            let n = fit_bytes_per_row(available);
+            if n < MAX_BYTES_PER_ROW {
+                let layout = Layout {
+                    per_row: n,
+                    ascii: true,
+                };
+                assert!(
+                    layout.width() <= available as usize,
+                    "{n} bytes needs {} columns but only {available} are free",
+                    layout.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn widening_the_terminal_never_narrows_the_row() {
+        let mut last = 0;
+        for available in 0..400u16 {
+            let n = fit_bytes_per_row(available);
+            assert!(n >= last, "{available} columns went backwards");
+            last = n;
+        }
+    }
+
+    #[test]
+    fn known_widths_pick_the_expected_row() {
+        // 4n + 3 columns for the layout with ascii.
+        assert_eq!(fit_bytes_per_row(0), 8, "the floor holds when nothing fits");
+        assert_eq!(fit_bytes_per_row(34), 8);
+        assert_eq!(fit_bytes_per_row(35), 8, "8 bytes needs exactly 35");
+        assert_eq!(
+            fit_bytes_per_row(66),
+            8,
+            "16 bytes needs 67, so 66 stays at 8"
+        );
+        assert_eq!(fit_bytes_per_row(67), 16);
+        assert_eq!(fit_bytes_per_row(99), 24, "24 bytes needs 99");
+        assert_eq!(fit_bytes_per_row(131), 32);
+    }
+
+    #[test]
+    fn the_row_is_capped_however_wide_the_terminal() {
+        assert_eq!(fit_bytes_per_row(u16::MAX), MAX_BYTES_PER_ROW);
     }
 
     #[test]
