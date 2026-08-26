@@ -63,6 +63,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
     }
 
+    if let Some(View::File(view)) = app.views.last()
+        && view.notice
+    {
+        draw_identical_notice(frame, body, view, &theme);
+    }
+
     if app.help_visible {
         draw_help(
             frame,
@@ -621,6 +627,64 @@ fn draw_file_status(
     );
 }
 
+/// A small centred panel announcing that the two sides match.
+///
+/// Shown on opening and cleared by the first keystroke: two identical files render as a
+/// screen of unremarkable text, which looks the same as a diff that has not loaded.
+fn draw_identical_notice(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
+    // How big the thing that matched is — a line count for text, a size for bytes.
+    let size = match (view.cmp.hex, view.cmp.texts()) {
+        (Some(_), _) => {
+            let bytes = view.cmp.left.as_binary().map_or(0, <[u8]>::len);
+            human_size(bytes as u64)
+        }
+        (None, Some((left, _))) => {
+            let n = left.line_count();
+            format!("{n} line{}", if n == 1 { "" } else { "s" })
+        }
+        _ => String::new(),
+    };
+
+    let mut lines = vec![Line::from(Span::styled(
+        "  \u{2713}  identical".to_string(),
+        theme.identical,
+    ))];
+    // `--ignore-whitespace` and the CRLF case both reach this overlay, and there the
+    // headline alone would overstate it.
+    if let Some(note) = view.cmp.note.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!("     {note}"),
+            theme.warning,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        if size.is_empty() {
+            "     press any key".to_string()
+        } else {
+            format!("     {size} \u{00b7} press any key")
+        },
+        theme.status,
+    )));
+
+    let width = lines
+        .iter()
+        .map(ratatui::text::Line::width)
+        .max()
+        .unwrap_or(20)
+        .saturating_add(4)
+        .min(area.width as usize) as u16;
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 3,
+        width,
+        height,
+    };
+
+    Clear.render(popup, frame.buffer_mut());
+    frame.render_widget(Paragraph::new(lines).block(Block::bordered()), popup);
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
     const FILE_HELP: &[(&str, &str)] = &[
         ("j k / arrows", "move down / up"),
@@ -1109,6 +1173,9 @@ mod cursor_tests {
         )
         .expect("temp dir exists");
         app.views = vec![View::File(Box::new(app::FileView::new(cmp)))];
+        // These tests are about cursor styling on identical rows, so dismiss the overlay
+        // that would otherwise sit on top of them.
+        app.active_file().unwrap().notice = false;
         app
     }
 
@@ -1243,6 +1310,8 @@ mod hex_render_tests {
         )
         .expect("temp dir exists");
         app.views = vec![View::File(Box::new(app::FileView::new(cmp)))];
+        // Layout tests want the panes, not the overlay that appears on identical input.
+        app.active_file().unwrap().notice = false;
         app
     }
 
@@ -1373,5 +1442,170 @@ mod hex_render_tests {
         let mut app = hex_app(b"abcd", b"abce", 4);
         let _ = render(&mut app, 6, 3);
         let _ = render(&mut app, 1, 1);
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::app::{App, Options, View};
+    use crate::diff::{DiffOptions, Whitespace, compare_loaded};
+    use crate::text::{BinaryReason, FileContent, decode};
+    use crate::theme::Theme;
+    use crate::{Inputs, app};
+
+    fn text(body: &str) -> FileContent {
+        FileContent::Text(Box::new(decode(
+            std::path::Path::new("f"),
+            body.as_bytes().to_vec(),
+            None,
+        )))
+    }
+
+    fn binary(bytes: &[u8]) -> FileContent {
+        FileContent::Binary {
+            path: "b".into(),
+            size: bytes.len() as u64,
+            reason: BinaryReason::Nul,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn app_for(left: FileContent, right: FileContent, whitespace: Whitespace) -> App {
+        let opts = Options {
+            diff: DiffOptions {
+                whitespace,
+                hex_bytes_per_row: 4,
+                ..DiffOptions::default()
+            },
+            tab_width: 8,
+            max_file_size: u64::MAX,
+            follow_symlinks: false,
+            context: None,
+        };
+        let cmp = compare_loaded(left, right, &opts.diff);
+        let mut app = App::new(
+            Inputs::Dirs {
+                left: std::env::temp_dir(),
+                right: std::env::temp_dir(),
+            },
+            opts,
+            Theme::dark(),
+        )
+        .expect("temp dir exists");
+        app.views = vec![View::File(Box::new(app::FileView::configured(
+            cmp, None, whitespace,
+        )))];
+        app
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| super::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn identical_files_announce_themselves_on_opening() {
+        let mut app = app_for(
+            text("same\nhere\n"),
+            text("same\nhere\n"),
+            Whitespace::Exact,
+        );
+        let out = screen(&mut app, 50, 12);
+        assert!(out.contains('\u{2713}'), "expected a tick:\n{out}");
+        assert!(out.contains("identical"), "{out}");
+        assert!(out.contains("2 lines"), "{out}");
+        assert!(out.contains("press any key"), "{out}");
+    }
+
+    #[test]
+    fn the_notice_is_green() {
+        let mut app = app_for(text("a\n"), text("a\n"), Whitespace::Exact);
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let tick = (0..50u16)
+            .flat_map(|x| (0..12u16).map(move |y| (x, y)))
+            .find(|&(x, y)| buffer.cell((x, y)).unwrap().symbol() == "\u{2713}")
+            .expect("the tick should be on screen");
+        assert_eq!(
+            buffer.cell(tick).unwrap().style().fg,
+            Theme::dark().identical.fg,
+            "the good news should be green"
+        );
+    }
+
+    #[test]
+    fn differing_files_get_no_notice() {
+        let mut app = app_for(text("one\n"), text("two\n"), Whitespace::Exact);
+        let out = screen(&mut app, 50, 12);
+        assert!(
+            !out.contains('\u{2713}'),
+            "a real diff must not claim to match:\n{out}"
+        );
+    }
+
+    #[test]
+    fn identical_binaries_report_their_size_instead_of_a_line_count() {
+        let mut app = app_for(
+            binary(&[0u8; 2048]),
+            binary(&[0u8; 2048]),
+            Whitespace::Exact,
+        );
+        let out = screen(&mut app, 50, 12);
+        assert!(out.contains("2.0 KiB"), "{out}");
+        assert!(out.contains("identical"), "{out}");
+    }
+
+    #[test]
+    fn a_whitespace_only_match_carries_the_caveat() {
+        // The headline says identical; the caveat says why. Both matter.
+        let mut app = app_for(text("a  b\n"), text("a b\n"), Whitespace::IgnoreChanges);
+        let out = screen(&mut app, 60, 12);
+        assert!(out.contains('\u{2713}'), "{out}");
+        assert!(out.contains("apart from whitespace"), "{out}");
+    }
+
+    #[test]
+    fn the_first_keystroke_clears_it_and_still_does_its_job() {
+        let mut app = app_for(text("a\nb\nc\n"), text("a\nb\nc\n"), Whitespace::Exact);
+        assert!(app.active_file().unwrap().notice);
+
+        // 'j' dismisses the notice *and* moves the cursor: it is informational, not modal.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(!app.active_file().unwrap().notice);
+        assert_eq!(app.active_file().unwrap().cursor, 1);
+
+        let out = screen(&mut app, 50, 12);
+        assert!(!out.contains('\u{2713}'));
+    }
+
+    #[test]
+    fn escape_dismisses_and_leaves_in_one_press() {
+        // Opening an identical file from the directory view and pressing Esc should go
+        // straight back, not eat the keystroke on the overlay.
+        let mut app = app_for(text("a\n"), text("a\n"), Whitespace::Exact);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit, "Esc on the only view should still quit");
+    }
+
+    #[test]
+    fn a_tiny_terminal_does_not_panic() {
+        let mut app = app_for(text("a\n"), text("a\n"), Whitespace::Exact);
+        let _ = screen(&mut app, 8, 4);
+        let _ = screen(&mut app, 1, 1);
     }
 }

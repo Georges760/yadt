@@ -112,6 +112,11 @@ Exit codes follow `diff(1)`: **0** identical, **1** differences found, **2** err
 
 ## Behaviour worth knowing
 
+- **Identical files say so.** Opening a pair that matches shows a green `{2713} identical`
+  panel rather than leaving you looking at a screen of unremarkable text that could just as
+  easily be a diff that has not loaded. It clears on the first keystroke, and that
+  keystroke still does its normal job -- so `Esc` goes straight back to the directory
+  view. When the match depends on a flag, the caveat is on the panel too.
 - **Search** is smart-case: a lower-case query matches any case, a query with a capital
   matches exactly. `n`/`p` stay bound to hunks and matches are on `N`/`P`, so there are no
   modes -- both work at once. A hit hidden inside a fold expands it.

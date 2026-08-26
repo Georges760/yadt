@@ -68,6 +68,8 @@ pub struct FileView {
     pub whitespace: crate::diff::Whitespace,
     /// The active search, if any.
     pub search: Option<SearchState>,
+    /// Show the "identical" overlay until the first keystroke.
+    pub notice: bool,
     /// First visible view row. One value, both panes — this *is* the synchronized
     /// scrolling.
     pub top: usize,
@@ -94,6 +96,7 @@ impl FileView {
         context: Option<u32>,
         whitespace: crate::diff::Whitespace,
     ) -> Self {
+        let (cmp_differs, cmp_failed) = (cmp.differ, cmp.failed);
         let mut view = Self {
             cmp,
             rows: Vec::new(),
@@ -105,6 +108,9 @@ impl FileView {
             focus: SideIdx::LEFT,
             viewport: 1,
             search: None,
+            // Worth saying out loud: a screen of two identical files looks exactly like a
+            // screen where the diff has not loaded yet.
+            notice: !cmp_differs && !cmp_failed,
         };
         view.rebuild_rows();
         view
@@ -780,6 +786,12 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // The identical overlay is informational, not modal: the first keystroke clears it
+        // *and* does what it normally would, so Esc still goes straight back.
+        if let Some(view) = self.active_file() {
+            view.notice = false;
+        }
 
         // While a prompt is open it owns the keyboard, so a query can contain q, j, or
         // anything else that would otherwise be a command.

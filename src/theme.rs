@@ -31,6 +31,7 @@ pub struct Theme {
     pub search: Style,
     pub search_current: Style,
     pub warning: Style,
+    pub identical: Style,
 }
 
 impl Theme {
@@ -60,6 +61,9 @@ impl Theme {
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
             warning: Style::new().fg(Color::Yellow),
+            identical: Style::new()
+                .fg(Color::Rgb(120, 220, 140))
+                .add_modifier(Modifier::BOLD),
         }
     }
 
@@ -88,6 +92,7 @@ impl Theme {
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
             warning: plain.add_modifier(Modifier::BOLD),
+            identical: plain.add_modifier(Modifier::BOLD),
         }
     }
 
