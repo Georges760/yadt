@@ -546,3 +546,163 @@ mod tests {
         assert!(!f.final_newline);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------------------
+
+impl TextFile {
+    /// Every line as (text, terminator length), which is the form edits work on.
+    fn parts(&self) -> Vec<(&str, u8)> {
+        self.lines
+            .iter()
+            .map(|r| (&self.text[r.start as usize..r.end as usize], r.eol_len))
+            .collect()
+    }
+
+    /// The terminator new lines get: whatever this file mostly uses.
+    fn native_eol_len(&self) -> u8 {
+        match self.eol {
+            EolStyle::Crlf => 2,
+            _ => 1,
+        }
+    }
+
+    /// Replace lines `range` with `replacement`, returning the edited file.
+    ///
+    /// Existing lines keep the terminator they were read with, so a mixed-ending file is
+    /// not silently rewritten; new lines take the file's own style, so copying an LF line
+    /// into a CRLF file writes CRLF. Only the last line's terminator is forced, to stay
+    /// consistent with `final_newline`.
+    pub fn splice_lines(&self, range: std::ops::Range<usize>, replacement: &[&str]) -> Self {
+        let native = self.native_eol_len();
+        let mut parts: Vec<(String, u8)> = self
+            .parts()
+            .into_iter()
+            .map(|(text, eol)| (text.to_string(), eol))
+            .collect();
+
+        let range = range.start.min(parts.len())..range.end.min(parts.len());
+        let inserted = replacement.iter().map(|line| ((*line).to_string(), native));
+        parts.splice(range, inserted);
+
+        // The final terminator belongs to the file, not to whichever line ended up last.
+        if let Some(last) = parts.last_mut() {
+            last.1 = if self.final_newline { native } else { 0 };
+        }
+
+        let mut text = String::with_capacity(self.text.len());
+        for (body, eol) in &parts {
+            text.push_str(body);
+            match eol {
+                2 => text.push_str("\r\n"),
+                1 => text.push('\n'),
+                _ => {}
+            }
+        }
+
+        // Re-split rather than tracking ranges by hand: the result then goes through
+        // exactly the same code a freshly loaded file does, so the two cannot diverge.
+        let (lines, eol, final_newline) = split_lines(&text);
+        Self {
+            path: self.path.clone(),
+            size: text.len() as u64,
+            text,
+            lines,
+            eol,
+            final_newline,
+            had_invalid_utf8: self.had_invalid_utf8,
+            bom: self.bom,
+        }
+    }
+
+    /// The exact bytes this file would be written as, BOM and terminators included.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.text.len() + 3);
+        if let Some(bom) = self.bom {
+            // Only UTF-8 reaches here; the others are never decoded in the first place.
+            if bom.is_utf8() {
+                out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+        }
+        out.extend_from_slice(self.text.as_bytes());
+        out
+    }
+}
+
+/// What a file looked like on disk when it was read, so an overwrite can notice that
+/// something else has touched it since.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stamp {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    pub fn of(path: &Path) -> io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum SaveError {
+    /// The file changed on disk since it was read.
+    Stale,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale => write!(f, "changed on disk since it was opened"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Write `bytes` to `path`, refusing if the file no longer matches `expected`.
+///
+/// Writes a sibling temporary file and renames it over the target, so an interrupted save
+/// cannot leave a half-written file where the original was. The temporary is created in
+/// the same directory precisely so the rename is atomic rather than a cross-device copy.
+pub fn save_atomic(path: &Path, bytes: &[u8], expected: Stamp) -> Result<Stamp, SaveError> {
+    // Check as late as possible: the window cannot be closed, only narrowed.
+    match Stamp::of(path) {
+        Ok(current) if current == expected => {}
+        Ok(_) => return Err(SaveError::Stale),
+        // Vanished since it was read, which is also not what the user agreed to overwrite.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(SaveError::Stale),
+        Err(e) => return Err(SaveError::Io(e)),
+    }
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("yadt"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let mut temp = std::ffi::OsString::from(".");
+    temp.push(&name);
+    temp.push(".yadt-tmp");
+    let temp = dir.join(temp);
+
+    let write = || -> io::Result<()> {
+        std::fs::write(&temp, bytes)?;
+        // Carry the original mode across; a fresh file would otherwise take the umask.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&temp, meta.permissions());
+        }
+        std::fs::rename(&temp, path)
+    };
+
+    match write() {
+        Ok(()) => Stamp::of(path).map_err(SaveError::Io),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(SaveError::Io(e))
+        }
+    }
+}

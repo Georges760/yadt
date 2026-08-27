@@ -15,6 +15,7 @@ use ratatui::layout::Rect;
 
 use crate::diff::{DiffOptions, FileComparison};
 use crate::dirdiff::{DirEntryRow, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan};
+use crate::edit::{self, Edit};
 use crate::model::{self, SideIdx, ViewRow};
 use crate::pane::MAX_H_SCROLL;
 use crate::search::{self, Match};
@@ -66,8 +67,12 @@ pub struct FileView {
     pub rows: Vec<ViewRow>,
     /// `Some(n)` collapses equal runs, keeping `n` rows of context. `None` shows every row.
     pub context: Option<u32>,
-    /// Recorded only so the status bar can say when comparison is not exact.
-    pub whitespace: crate::diff::Whitespace,
+    /// Kept so an edit can re-diff with the same settings the comparison was made with.
+    pub diff_opts: DiffOptions,
+    /// Edits that can still be undone, most recent last.
+    pub undo_log: Vec<Edit>,
+    /// Which sides have unsaved changes.
+    pub dirty: [bool; 2],
     /// The active search, if any.
     pub search: Option<SearchState>,
     /// Show the "identical" overlay until the first keystroke.
@@ -92,20 +97,18 @@ impl FileView {
     }
 
     pub fn with_context(cmp: FileComparison, context: Option<u32>) -> Self {
-        Self::configured(cmp, context, crate::diff::Whitespace::Exact)
+        Self::configured(cmp, context, DiffOptions::default())
     }
 
-    pub fn configured(
-        cmp: FileComparison,
-        context: Option<u32>,
-        whitespace: crate::diff::Whitespace,
-    ) -> Self {
+    pub fn configured(cmp: FileComparison, context: Option<u32>, diff_opts: DiffOptions) -> Self {
         let (cmp_differs, cmp_failed) = (cmp.differ, cmp.failed);
         let mut view = Self {
             cmp,
             rows: Vec::new(),
             context,
-            whitespace,
+            diff_opts,
+            undo_log: Vec::new(),
+            dirty: [false; 2],
             top: 0,
             cursor: 0,
             h_scroll: 0,
@@ -648,6 +651,8 @@ pub struct App {
     pub views: Vec<View>,
     /// When set, keystrokes go here instead of to the active view.
     pub prompt: Option<Prompt>,
+    /// A quit was asked for while changes were unsaved, and is waiting to be confirmed.
+    pub quit_confirm: bool,
     pub opts: Options,
     pub theme: Theme,
     pub help_visible: bool,
@@ -688,6 +693,7 @@ impl App {
             opts,
             theme,
             prompt: None,
+            quit_confirm: false,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -726,10 +732,18 @@ impl App {
 
     pub fn pop_view(&mut self) {
         if self.views.len() <= 1 {
-            self.should_quit = true;
-        } else {
-            self.views.pop();
+            self.request_quit();
+            return;
         }
+        // Leaving a file view with edits pending drops them just as surely as quitting.
+        if matches!(self.views.last(), Some(View::File(f)) if f.is_dirty()) && !self.quit_confirm {
+            self.quit_confirm = true;
+            self.status =
+                "unsaved changes \u{2014} press again to discard, or s to save".to_string();
+            return;
+        }
+        self.views.pop();
+        self.quit_confirm = false;
     }
 
     /// Drain background work. Every directory view on the stack is ticked, not just the
@@ -782,7 +796,7 @@ impl App {
         };
         let cmp = crate::diff::compare_files(&left, &right, max_size, &diff_opts);
         self.status.clear();
-        let mut view = FileView::configured(cmp, context, diff_opts.whitespace);
+        let mut view = FileView::configured(cmp, context, diff_opts);
         view.hex_pinned = self.opts.hex_width_pinned;
         self.views.push(View::File(Box::new(view)));
     }
@@ -796,6 +810,17 @@ impl App {
             view.notice = false;
         }
 
+        // A pending quit confirmation only survives an immediate repeat: anything else
+        // means the user carried on working, and a stale confirmation would then let a
+        // later single keypress discard their edits.
+        let repeat = matches!(
+            key.code,
+            KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Esc
+        );
+        if !repeat {
+            self.quit_confirm = false;
+        }
+
         // While a prompt is open it owns the keyboard, so a query can contain q, j, or
         // anything else that would otherwise be a command.
         if self.prompt.is_some() {
@@ -805,11 +830,11 @@ impl App {
 
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                self.should_quit = true;
+                self.request_quit();
                 return;
             }
             KeyCode::Char('q') => {
-                self.should_quit = true;
+                self.request_quit();
                 return;
             }
             KeyCode::Char('?') => {
@@ -930,6 +955,24 @@ impl App {
             KeyCode::Char('H') => view.h_scroll = view.h_scroll.saturating_sub(8),
             KeyCode::Char('0') => view.h_scroll = 0,
             KeyCode::Char('z') => view.toggle_fold(),
+            KeyCode::Char('>') => {
+                let outcome = view.copy_hunk(SideIdx::LEFT);
+                self.status = report(outcome);
+            }
+            KeyCode::Char('<') => {
+                let outcome = view.copy_hunk(SideIdx::RIGHT);
+                self.status = report(outcome);
+            }
+            // Plain `u` undoes; Ctrl-u still pages, matched by the arm above.
+            KeyCode::Char('u') if !ctrl => {
+                let outcome = view.undo();
+                self.status = report(outcome);
+            }
+            KeyCode::Char('s') => {
+                self.status = match view.save() {
+                    Ok(message) | Err(message) => message,
+                };
+            }
             KeyCode::Char('N') => view.step_match(true),
             KeyCode::Char('P') => view.step_match(false),
             KeyCode::Enter => view.expand_fold(),
@@ -980,6 +1023,14 @@ impl App {
             KeyCode::Char('f') => view.cycle_filter(),
             _ => {}
         }
+    }
+}
+
+/// Turn an edit result into something for the status line.
+fn report(result: Result<(), &'static str>) -> String {
+    match result {
+        Ok(()) => String::new(),
+        Err(message) => message.to_string(),
     }
 }
 
@@ -1417,6 +1468,7 @@ mod search_view_tests {
             },
             theme: Theme::no_color(),
             prompt: None,
+            quit_confirm: false,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -1631,6 +1683,7 @@ mod hex_view_tests {
             },
             theme: Theme::no_color(),
             prompt: None,
+            quit_confirm: false,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -1892,5 +1945,581 @@ mod hex_fit_tests {
             .map(|e| (e.start, e.end))
             .collect();
         assert_eq!(spans, [(255 % 24, 255 % 24 + 1)]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------------------
+
+impl FileView {
+    /// Can this comparison be edited at all?
+    ///
+    /// Only a text-versus-text diff: a hex view has no lines to copy, and anything that
+    /// failed to load has no content to copy from.
+    pub fn editable(&self) -> bool {
+        self.cmp.hex.is_none() && self.cmp.alignment.is_some() && self.cmp.texts().is_some()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.iter().any(|d| *d)
+    }
+
+    fn side_text(&self, side: SideIdx) -> Option<&crate::text::TextFile> {
+        let content = if side == SideIdx::LEFT {
+            &self.cmp.left
+        } else {
+            &self.cmp.right
+        };
+        content.as_text()
+    }
+
+    fn set_side_text(&mut self, side: SideIdx, file: crate::text::TextFile) {
+        let slot = if side == SideIdx::LEFT {
+            &mut self.cmp.left
+        } else {
+            &mut self.cmp.right
+        };
+        *slot = crate::text::FileContent::Text(Box::new(file));
+    }
+
+    /// Recompute the diff after one side changed, keeping the cursor near `anchor`.
+    fn rediff(&mut self, anchor: u32) {
+        let Some((left, right)) = self.cmp.texts() else {
+            return;
+        };
+        let alignment = crate::diff::align_text(left, right, &self.diff_opts);
+        self.cmp.differ = !alignment.is_identical();
+        self.cmp.alignment = Some(alignment);
+        self.rebuild_rows();
+        self.search = None;
+
+        if let Some(index) = model::view_index_of(&self.rows, anchor) {
+            self.cursor = index;
+            self.top = self.cursor.saturating_sub(self.viewport as usize / 3);
+        }
+    }
+
+    /// Copy the hunk under the cursor from `from` onto the other side.
+    ///
+    /// Returns what happened, for the status line.
+    pub fn copy_hunk(&mut self, from: SideIdx) -> Result<(), &'static str> {
+        if !self.editable() {
+            return Err("this comparison cannot be edited");
+        }
+        let cursor_row = self.cursor_row().unwrap_or(0);
+        let hunk = self
+            .cmp
+            .alignment
+            .as_ref()
+            .and_then(|a| a.hunk_containing(cursor_row as usize))
+            .ok_or("the cursor is not on a change")?;
+
+        let to = if from == SideIdx::LEFT {
+            SideIdx::RIGHT
+        } else {
+            SideIdx::LEFT
+        };
+
+        let applied = {
+            let alignment = self.cmp.alignment.as_ref().ok_or("no diff")?;
+            let source = self.side_text(from).ok_or("no diff")?;
+            let target = self.side_text(to).ok_or("no diff")?;
+            edit::copy_hunk(alignment, hunk, from, source, to, target, cursor_row)
+        };
+        let Some(applied) = applied else {
+            return Err("the two sides already agree here");
+        };
+
+        self.set_side_text(to, applied.file);
+        self.undo_log.push(applied.edit);
+        // Oldest first, so dropping from the front keeps the most recent history.
+        if self.undo_log.len() > edit::UNDO_LIMIT {
+            self.undo_log.remove(0);
+        }
+        self.dirty[to.idx()] = true;
+        self.rediff(cursor_row);
+        Ok(())
+    }
+
+    /// Reverse the most recent edit.
+    pub fn undo(&mut self) -> Result<(), &'static str> {
+        let Some(edit) = self.undo_log.pop() else {
+            return Err("nothing to undo");
+        };
+        let restored = {
+            let current = self.side_text(edit.side).ok_or("no diff")?;
+            edit::undo(&edit, current)
+        };
+        self.set_side_text(edit.side, restored);
+        // The side stays dirty unless this was the only edit to it, in which case it is
+        // back to what was read from disk.
+        self.dirty[edit.side.idx()] = self.undo_log.iter().any(|e| e.side == edit.side);
+        self.rediff(edit.cursor_row);
+        Ok(())
+    }
+
+    /// Write every changed side back to disk.
+    pub fn save(&mut self) -> Result<String, String> {
+        if !self.is_dirty() {
+            return Err("nothing to save".to_string());
+        }
+        let mut saved = Vec::new();
+        for side in [SideIdx::LEFT, SideIdx::RIGHT] {
+            if !self.dirty[side.idx()] {
+                continue;
+            }
+            let Some(file) = self.side_text(side) else {
+                continue;
+            };
+            let (path, bytes) = (file.path.clone(), file.to_bytes());
+            let expected = self.cmp.stamps[side.idx()].unwrap_or_default();
+
+            match crate::text::save_atomic(&path, &bytes, expected) {
+                Ok(stamp) => {
+                    self.cmp.stamps[side.idx()] = Some(stamp);
+                    self.dirty[side.idx()] = false;
+                    saved.push(path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    ));
+                }
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+        Ok(format!("saved {}", saved.join(", ")))
+    }
+}
+
+/// Editing tests. These use the real filesystem for the save path on purpose: an atomic
+/// rename and a staleness check cannot be exercised against an in-memory fake.
+#[cfg(test)]
+mod edit_view_tests {
+    use super::*;
+    use crate::diff::{DiffOptions, compare_files};
+    use crossterm::event::KeyModifiers;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("yadt-edit-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn view(left: &Path, right: &Path) -> FileView {
+        let cmp = compare_files(left, right, u64::MAX, &DiffOptions::default());
+        let mut v = FileView::with_context(cmp, None);
+        v.viewport = 20;
+        v
+    }
+
+    fn side_text(v: &FileView, side: SideIdx) -> String {
+        let content = if side == SideIdx::LEFT {
+            &v.cmp.left
+        } else {
+            &v.cmp.right
+        };
+        String::from_utf8(content.as_text().unwrap().to_bytes()).unwrap()
+    }
+
+    /// Put the cursor on the first change.
+    fn on_first_hunk(v: &mut FileView) {
+        v.cursor = 0;
+        v.goto_hunk(true);
+        if v.cmp
+            .alignment
+            .as_ref()
+            .unwrap()
+            .hunk_containing(0)
+            .is_some()
+        {
+            v.cursor = 0;
+        }
+    }
+
+    #[test]
+    fn copying_left_to_right_changes_only_the_right() {
+        let s = Scratch::new("l2r");
+        let (l, r) = (s.file("l", "a\nLEFT\nb\n"), s.file("r", "a\nright\nb\n"));
+        let mut v = view(&l, &r);
+        on_first_hunk(&mut v);
+
+        assert!(v.copy_hunk(SideIdx::LEFT).is_ok());
+        assert_eq!(side_text(&v, SideIdx::RIGHT), "a\nLEFT\nb\n");
+        assert_eq!(side_text(&v, SideIdx::LEFT), "a\nLEFT\nb\n");
+        assert_eq!(v.dirty, [false, true], "only the target is dirty");
+        // The sides now agree, so the diff reflects it.
+        assert!(v.cmp.alignment.as_ref().unwrap().is_identical());
+        assert!(!v.cmp.differ);
+    }
+
+    #[test]
+    fn copying_right_to_left_changes_only_the_left() {
+        let s = Scratch::new("r2l");
+        let (l, r) = (s.file("l", "a\nLEFT\nb\n"), s.file("r", "a\nright\nb\n"));
+        let mut v = view(&l, &r);
+        on_first_hunk(&mut v);
+
+        assert!(v.copy_hunk(SideIdx::RIGHT).is_ok());
+        assert_eq!(side_text(&v, SideIdx::LEFT), "a\nright\nb\n");
+        assert_eq!(v.dirty, [true, false]);
+    }
+
+    #[test]
+    fn undo_puts_it_back_and_clears_the_dirty_flag() {
+        let s = Scratch::new("undo");
+        let (l, r) = (s.file("l", "a\nLEFT\nb\n"), s.file("r", "a\nright\nb\n"));
+        let mut v = view(&l, &r);
+        on_first_hunk(&mut v);
+
+        v.copy_hunk(SideIdx::LEFT).unwrap();
+        assert!(v.is_dirty());
+
+        v.undo().unwrap();
+        assert_eq!(side_text(&v, SideIdx::RIGHT), "a\nright\nb\n");
+        assert!(!v.is_dirty(), "back to what was read, so nothing to save");
+        assert!(v.undo_log.is_empty());
+        assert!(v.cmp.differ, "the difference is back");
+    }
+
+    #[test]
+    fn undo_unwinds_several_edits_in_order() {
+        let s = Scratch::new("multi");
+        let (l, r) = (
+            s.file("l", "A\nb\nC\nd\nE\n"),
+            s.file("r", "1\nb\n3\nd\n5\n"),
+        );
+        let mut v = view(&l, &r);
+
+        // Copy every hunk across, one at a time.
+        let mut copied = 0;
+        while let Some(hunk) = v
+            .cmp
+            .alignment
+            .as_ref()
+            .and_then(|a| a.hunks().first().copied())
+        {
+            v.cursor = model::view_index_of(&v.rows, hunk.start).unwrap();
+            if v.copy_hunk(SideIdx::LEFT).is_err() {
+                break;
+            }
+            copied += 1;
+        }
+        assert!(copied >= 3, "expected several hunks, copied {copied}");
+        assert_eq!(side_text(&v, SideIdx::RIGHT), "A\nb\nC\nd\nE\n");
+
+        for _ in 0..copied {
+            v.undo().unwrap();
+        }
+        assert_eq!(side_text(&v, SideIdx::RIGHT), "1\nb\n3\nd\n5\n");
+        assert!(!v.is_dirty());
+    }
+
+    #[test]
+    fn undoing_with_no_history_says_so() {
+        let s = Scratch::new("noundo");
+        let (l, r) = (s.file("l", "a\n"), s.file("r", "b\n"));
+        let mut v = view(&l, &r);
+        assert_eq!(v.undo(), Err("nothing to undo"));
+    }
+
+    #[test]
+    fn copying_off_a_change_is_refused() {
+        let s = Scratch::new("nohunk");
+        let (l, r) = (s.file("l", "same\nx\n"), s.file("r", "same\ny\n"));
+        let mut v = view(&l, &r);
+        v.cursor = 0; // row 0 is equal
+        assert_eq!(
+            v.copy_hunk(SideIdx::LEFT),
+            Err("the cursor is not on a change")
+        );
+        assert!(!v.is_dirty(), "a refused copy must not mark anything dirty");
+    }
+
+    #[test]
+    fn saving_writes_the_file_and_clears_the_flag() {
+        let s = Scratch::new("save");
+        let (l, r) = (s.file("l", "a\nLEFT\nb\n"), s.file("r", "a\nright\nb\n"));
+        let mut v = view(&l, &r);
+        on_first_hunk(&mut v);
+        v.copy_hunk(SideIdx::LEFT).unwrap();
+
+        let message = v.save().expect("the save should succeed");
+        assert!(message.contains("saved"), "{message}");
+        assert_eq!(std::fs::read_to_string(&r).unwrap(), "a\nLEFT\nb\n");
+        // The untouched side is left exactly as it was.
+        assert_eq!(std::fs::read_to_string(&l).unwrap(), "a\nLEFT\nb\n");
+        assert!(!v.is_dirty());
+    }
+
+    #[test]
+    fn saving_with_nothing_to_save_is_refused() {
+        let s = Scratch::new("nosave");
+        let (l, r) = (s.file("l", "a\n"), s.file("r", "b\n"));
+        let mut v = view(&l, &r);
+        assert!(v.save().is_err());
+        // And nothing was touched.
+        assert_eq!(std::fs::read_to_string(&r).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn saving_refuses_a_file_that_changed_underneath() {
+        let s = Scratch::new("stale");
+        let (l, r) = (s.file("l", "a\nLEFT\nb\n"), s.file("r", "a\nright\nb\n"));
+        let mut v = view(&l, &r);
+        on_first_hunk(&mut v);
+        v.copy_hunk(SideIdx::LEFT).unwrap();
+
+        // Somebody else edits it while we were looking.
+        std::fs::write(&r, "someone else was here\n").unwrap();
+
+        let err = v
+            .save()
+            .expect_err("a changed file must not be overwritten");
+        assert!(err.contains("changed on disk"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&r).unwrap(),
+            "someone else was here\n",
+            "their work must survive"
+        );
+        assert!(v.is_dirty(), "our edit is still pending");
+    }
+
+    #[test]
+    fn saving_leaves_no_temporary_behind() {
+        let s = Scratch::new("tmp");
+        let (l, r) = (s.file("l", "a\nX\n"), s.file("r", "a\ny\n"));
+        let mut v = view(&l, &r);
+        on_first_hunk(&mut v);
+        v.copy_hunk(SideIdx::LEFT).unwrap();
+        v.save().unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(&s.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("yadt-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn a_hex_comparison_cannot_be_edited() {
+        let s = Scratch::new("hex");
+        let (l, r) = (s.file("l", "a\0b"), s.file("r", "a\0c"));
+        let mut v = view(&l, &r);
+        assert!(!v.editable());
+        assert_eq!(
+            v.copy_hunk(SideIdx::LEFT),
+            Err("this comparison cannot be edited")
+        );
+    }
+
+    #[test]
+    fn the_keys_are_wired_up() {
+        let s = Scratch::new("keys");
+        let (l, r) = (s.file("l", "a\nLEFT\nb\n"), s.file("r", "a\nright\nb\n"));
+        let cmp = compare_files(&l, &r, u64::MAX, &DiffOptions::default());
+        let mut app = App {
+            views: vec![View::File(Box::new(FileView::with_context(cmp, None)))],
+            opts: Options {
+                diff: DiffOptions::default(),
+                tab_width: 8,
+                max_file_size: u64::MAX,
+                follow_symlinks: false,
+                context: None,
+                hex_width_pinned: false,
+            },
+            theme: Theme::no_color(),
+            prompt: None,
+            quit_confirm: false,
+            help_visible: false,
+            status: String::new(),
+            should_quit: false,
+            exit_code: 0,
+        };
+        let press = |app: &mut App, c: char| {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+
+        app.active_file().unwrap().cursor = 1;
+        press(&mut app, '>');
+        assert_eq!(
+            side_text(app.active_file().unwrap(), SideIdx::RIGHT),
+            "a\nLEFT\nb\n"
+        );
+
+        press(&mut app, 'u');
+        assert_eq!(
+            side_text(app.active_file().unwrap(), SideIdx::RIGHT),
+            "a\nright\nb\n"
+        );
+
+        // 'u' alone undoes; Ctrl-u must still page.
+        app.active_file().unwrap().cursor = 1;
+        press(&mut app, '>');
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(
+            app.active_file().unwrap().is_dirty(),
+            "Ctrl-u should page, not undo"
+        );
+
+        press(&mut app, 's');
+        assert!(app.status.contains("saved"), "status was {:?}", app.status);
+        assert_eq!(std::fs::read_to_string(&r).unwrap(), "a\nLEFT\nb\n");
+    }
+}
+
+impl App {
+    /// Are there edits on any view that have not reached disk?
+    pub fn has_unsaved(&self) -> bool {
+        self.views.iter().any(|v| match v {
+            View::File(f) => f.is_dirty(),
+            View::Dir(_) => false,
+        })
+    }
+
+    /// Quit, unless that would throw work away without saying so.
+    ///
+    /// The second press goes through. Leaving without warning would be the one way this
+    /// tool could lose something the user typed.
+    fn request_quit(&mut self) {
+        if self.has_unsaved() && !self.quit_confirm {
+            self.quit_confirm = true;
+            self.status =
+                "unsaved changes \u{2014} press again to discard, or s to save".to_string();
+            return;
+        }
+        self.should_quit = true;
+    }
+}
+
+#[cfg(test)]
+mod quit_guard_tests {
+    use super::*;
+    use crate::diff::{DiffOptions, compare_loaded};
+    use crate::text::{FileContent, decode};
+    use crossterm::event::KeyModifiers;
+
+    fn text(body: &str) -> FileContent {
+        FileContent::Text(Box::new(decode(
+            std::path::Path::new("f"),
+            body.as_bytes().to_vec(),
+            None,
+        )))
+    }
+
+    fn app() -> App {
+        let cmp = compare_loaded(text("a\nX\n"), text("a\ny\n"), &DiffOptions::default());
+        App {
+            views: vec![View::File(Box::new(FileView::with_context(cmp, None)))],
+            opts: Options {
+                diff: DiffOptions::default(),
+                tab_width: 8,
+                max_file_size: u64::MAX,
+                follow_symlinks: false,
+                context: None,
+                hex_width_pinned: false,
+            },
+            theme: Theme::no_color(),
+            prompt: None,
+            quit_confirm: false,
+            help_visible: false,
+            status: String::new(),
+            should_quit: false,
+            exit_code: 0,
+        }
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    fn dirty_app() -> App {
+        let mut app = app();
+        let view = app.active_file().unwrap();
+        view.cursor = 1;
+        view.copy_hunk(SideIdx::LEFT).unwrap();
+        assert!(app.has_unsaved());
+        app
+    }
+
+    #[test]
+    fn quitting_with_no_edits_needs_no_confirmation() {
+        let mut app = app();
+        press(&mut app, 'q');
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn quitting_with_edits_asks_first() {
+        let mut app = dirty_app();
+        press(&mut app, 'q');
+        assert!(!app.should_quit, "the first press must not discard edits");
+        assert!(
+            app.status.contains("unsaved"),
+            "status was {:?}",
+            app.status
+        );
+
+        press(&mut app, 'q');
+        assert!(app.should_quit, "the second press goes through");
+    }
+
+    #[test]
+    fn escape_out_of_a_dirty_view_asks_too() {
+        let mut app = dirty_app();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn carrying_on_working_cancels_the_pending_confirmation() {
+        // Otherwise a q pressed minutes ago would let a single later q throw work away.
+        let mut app = dirty_app();
+        press(&mut app, 'q');
+        assert!(app.quit_confirm);
+
+        press(&mut app, 'j');
+        assert!(!app.quit_confirm, "moving the cursor cancels it");
+
+        press(&mut app, 'q');
+        assert!(!app.should_quit, "so this is a first press again");
+    }
+
+    #[test]
+    fn saving_removes_the_need_to_confirm() {
+        let mut app = dirty_app();
+        // Pretend the save succeeded; the flag is what the guard reads.
+        app.active_file().unwrap().dirty = [false; 2];
+        press(&mut app, 'q');
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn undoing_back_to_clean_removes_it_too() {
+        let mut app = dirty_app();
+        app.active_file().unwrap().undo().unwrap();
+        assert!(!app.has_unsaved());
+        press(&mut app, 'q');
+        assert!(app.should_quit);
     }
 }

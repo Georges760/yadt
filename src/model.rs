@@ -206,6 +206,15 @@ impl Alignment {
         self.hunks.get(i).copied()
     }
 
+    /// The hunk containing `row`, if it is inside one.
+    pub fn hunk_containing(&self, row: usize) -> Option<Hunk> {
+        let i = self.hunks.partition_point(|h| (h.end as usize) <= row);
+        self.hunks
+            .get(i)
+            .copied()
+            .filter(|h| (h.start as usize) <= row)
+    }
+
     /// The last hunk starting strictly before `row`.
     pub fn hunk_before(&self, row: usize) -> Option<Hunk> {
         let i = self.hunks.partition_point(|h| (h.start as usize) < row);
@@ -224,6 +233,20 @@ impl Alignment {
             Cell::Filler => true,
         });
         (self.rows.get(i)?.cells[s] == Cell::Line(line)).then_some(i)
+    }
+
+    /// The first line of `side` at or after `row`, or the line count if there is none.
+    ///
+    /// This is what turns a hunk into a line range to splice: taken at both ends of a
+    /// hunk it gives the range to replace, and it degenerates correctly to an empty range
+    /// at the right insertion point when the side has no lines in the hunk at all.
+    pub fn line_at_or_after(&self, row: usize, side: SideIdx) -> u32 {
+        for r in row..self.rows.len() {
+            if let Cell::Line(n) = self.rows[r].cells[side.idx()] {
+                return n.0;
+            }
+        }
+        self.line_counts[side.idx()]
     }
 
     /// True when the two sides are the same all the way down.

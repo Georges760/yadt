@@ -240,6 +240,9 @@ pub struct FileComparison {
     pub note: Option<String>,
     /// `Some(bytes_per_row)` when the alignment is over bytes rather than lines.
     pub hex: Option<u32>,
+    /// What each side looked like on disk when it was read, so a save can refuse to
+    /// overwrite something that has changed underneath.
+    pub stamps: [Option<crate::text::Stamp>; 2],
     pub differ: bool,
     /// A side could not be read or was refused, so the comparison is not authoritative.
     pub failed: bool,
@@ -259,9 +262,15 @@ pub fn compare_files(
     max_size: u64,
     opts: &DiffOptions,
 ) -> FileComparison {
+    let stamps = [
+        crate::text::Stamp::of(left).ok(),
+        crate::text::Stamp::of(right).ok(),
+    ];
     let left = crate::text::load(left, max_size);
     let right = crate::text::load(right, max_size);
-    compare_loaded(left, right, opts)
+    let mut cmp = compare_loaded(left, right, opts);
+    cmp.stamps = stamps;
+    cmp
 }
 
 /// Compare two already-loaded sides.
@@ -280,6 +289,7 @@ pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions)
             differ,
             failed: false,
             hex: Some(opts.hex_bytes_per_row.max(1)),
+            stamps: [None; 2],
         };
     }
 
@@ -326,6 +336,7 @@ pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions)
                 differ,
                 failed: false,
                 hex: None,
+                stamps: [None; 2],
             }
         }
         _ => {
@@ -356,6 +367,7 @@ pub fn compare_loaded(left: FileContent, right: FileContent, opts: &DiffOptions)
                 differ,
                 failed,
                 hex: None,
+                stamps: [None; 2],
             }
         }
     }

@@ -6,7 +6,8 @@ two files side by side, or two directory trees, giving in the terminal roughly w
 status, word-level highlighting inside changed lines, and drill-down from a differing
 directory entry into its file diff.
 
-It is **read-only**. yadt never writes to the files it is comparing.
+Hunks can be copied between the two sides and saved; nothing reaches disk until you ask
+for it.
 
 ## Usage
 
@@ -73,6 +74,9 @@ directory on one side and a file on the other; `↻` is a symlink cycle.
 | `h` `l` / arrows | scroll horizontally (`H` `L` by 8, `0` to reset) |
 | `/` | search (smart-case) |
 | `N` `P` | next / previous match |
+| `>` `<` | copy the hunk under the cursor to the other side |
+| `u` | undo |
+| `s` | save changed files |
 | `z` | fold / unfold identical runs |
 | `Enter` | expand the fold under the cursor |
 | `Tab` | switch focused side |
@@ -109,6 +113,24 @@ directory on one side and a file on the other; `↻` is a symlink cycle.
 
 Exit codes follow `diff(1)`: **0** identical, **1** differences found, **2** error. So
 `yadt --quiet a b` is usable from a script.
+
+## Editing
+
+`>` copies the hunk under the cursor onto the right, `<` onto the left, `u` undoes, `s`
+writes the changed files.
+
+Nothing is written until `s`. A side with pending edits is marked `{25cf}` in its header
+and named in the status bar, and quitting or leaving the view with edits pending asks once
+before discarding them.
+
+Saves go through a sibling temporary file and a rename, so an interrupted write cannot
+leave a half-written file where the original was, and the original permissions are carried
+across. **A save refuses if the file changed on disk** since yadt read it, rather than
+overwriting someone else's work.
+
+The target file decides how its own lines end: copying an LF line into a CRLF file writes
+CRLF, and a file that ended without a trailing newline still does. Hex comparisons cannot
+be edited -- there are no lines to copy -- and say so.
 
 ## Behaviour worth knowing
 

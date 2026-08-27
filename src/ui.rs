@@ -332,20 +332,21 @@ fn draw_dir_status(
 fn draw_file_header(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
     let [left, _, right] = pane_columns(area);
     let focus = view.focus;
-    render_path(
-        frame,
-        left,
-        view.cmp.left.path(),
-        focus == SideIdx::LEFT,
-        theme,
-    );
-    render_path(
-        frame,
-        right,
-        view.cmp.right.path(),
-        focus == SideIdx::RIGHT,
-        theme,
-    );
+    for (side, area) in [(SideIdx::LEFT, left), (SideIdx::RIGHT, right)] {
+        let path = if side == SideIdx::LEFT {
+            view.cmp.left.path()
+        } else {
+            view.cmp.right.path()
+        };
+        // A side with unsaved changes is marked, so nothing is edited invisibly.
+        if view.dirty[side.idx()] {
+            let style = theme.warning;
+            let text = truncate_left(&format!("\u{25cf} {}", path.display()), area.width as usize);
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+        } else {
+            render_path(frame, area, path, focus == side, theme);
+        }
+    }
 }
 
 fn render_path(
@@ -599,6 +600,19 @@ fn draw_file_status(
     if view.h_scroll > 0 {
         parts.push(format!("col +{}", view.h_scroll));
     }
+    if view.is_dirty() {
+        parts.push(format!(
+            "modified: {}",
+            match (view.dirty[0], view.dirty[1]) {
+                (true, true) => "both",
+                (true, false) => "left",
+                _ => "right",
+            }
+        ));
+    }
+    if !view.undo_log.is_empty() {
+        parts.push(format!("{} to undo", view.undo_log.len()));
+    }
     if let Some(search) = view.search.as_ref() {
         parts.push(if search.matches.is_empty() {
             format!("/{} no match", search.query)
@@ -611,8 +625,8 @@ fn draw_file_status(
             )
         });
     }
-    if view.whitespace != crate::diff::Whitespace::Exact {
-        parts.push(format!("ws: {}", view.whitespace.label()));
+    if view.diff_opts.whitespace != crate::diff::Whitespace::Exact {
+        parts.push(format!("ws: {}", view.diff_opts.whitespace.label()));
     }
     if let Some(context) = view.context {
         let hidden = view.hidden_rows();
@@ -705,24 +719,20 @@ fn draw_identical_notice(frame: &mut Frame<'_>, area: Rect, view: &FileView, the
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
+    // Grouped rather than one key per line: the list has to fit a short terminal, and a
+    // clipped help screen is worse than a terse one.
     const FILE_HELP: &[(&str, &str)] = &[
         ("j k / arrows", "move down / up"),
-        ("Ctrl-d Ctrl-u", "half page"),
-        ("PgDn PgUp Space b", "page"),
+        ("PgDn PgUp Ctrl-d Ctrl-u", "page / half page"),
         ("g G", "first / last row"),
         ("n p", "next / previous hunk"),
-        ("h l / arrows", "scroll horizontally"),
-        ("H L", "scroll horizontally by 8"),
-        ("0", "back to column 0"),
-        ("/", "search"),
-        ("N", "next match"),
-        ("P", "previous match"),
-        ("z", "fold / unfold identical runs"),
-        ("Enter", "expand the fold under the cursor"),
+        ("h l   H L   0", "scroll horizontally"),
+        ("/   N P", "search, next / previous match"),
+        ("> <", "copy the hunk to the other side"),
+        ("u   s", "undo, save changed files"),
+        ("z   Enter", "fold / unfold, expand one fold"),
         ("Tab", "switch focused side"),
-        ("?", "toggle this help"),
-        ("Esc", "back, or quit"),
-        ("q  Ctrl-C", "quit"),
+        ("?   Esc   q", "help, back, quit"),
     ];
     const DIR_HELP: &[(&str, &str)] = &[
         ("j k / arrows", "move down / up"),
@@ -739,7 +749,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
     ];
 
     let help = if dir_mode { DIR_HELP } else { FILE_HELP };
-    let width = 48.min(area.width);
+    let width = 58.min(area.width);
     let height = (help.len() as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -752,7 +762,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
         .iter()
         .map(|(keys, what)| {
             Line::from(vec![
-                Span::styled(format!(" {keys:<18}"), theme.header_focus),
+                Span::styled(format!(" {keys:<24}"), theme.header_focus),
                 Span::styled((*what).to_string(), Style::new()),
             ])
         })
@@ -1525,7 +1535,12 @@ mod notice_tests {
         )
         .expect("temp dir exists");
         app.views = vec![View::File(Box::new(app::FileView::configured(
-            cmp, None, whitespace,
+            cmp,
+            None,
+            DiffOptions {
+                whitespace,
+                ..DiffOptions::default()
+            },
         )))];
         app
     }

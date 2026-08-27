@@ -7,6 +7,7 @@
 pub mod app;
 pub mod diff;
 pub mod dirdiff;
+pub mod edit;
 pub mod hex;
 pub mod model;
 pub mod pane;
