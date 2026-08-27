@@ -344,19 +344,20 @@ impl AlignmentBuilder {
         start..start + height
     }
 
-    /// Emit a block with an explicit per-row cell layout.
+    /// Emit a block with an explicit per-row layout and kind.
     ///
-    /// The escape hatch for a smarter replace-pairing policy than index order: the caller
-    /// supplies the rows, the builder still owns the cursor bookkeeping.
+    /// The escape hatch from index-order pairing: the caller decides which lines belong
+    /// opposite which, and marks each row for what it is, while the builder still owns
+    /// the cursor bookkeeping.
     ///
     /// # Panics
     /// If `pairs` does not consume each side's lines contiguously from the cursor.
-    pub fn push_paired(&mut self, kind: RowKind, pairs: &[[Cell; MAX_SIDES]]) -> Range<u32> {
+    pub fn push_paired(&mut self, pairs: &[(RowKind, [Cell; MAX_SIDES])]) -> Range<u32> {
         let sides = self.side_count();
         let start = self.rows.len() as u32;
         let mut consumed = [0u32; MAX_SIDES];
 
-        for cells in pairs {
+        for (kind, cells) in pairs {
             for (s, ((cell, cursor), consumed)) in cells[..sides]
                 .iter()
                 .zip(&self.cursor[..sides])
@@ -373,7 +374,7 @@ impl AlignmentBuilder {
                 }
             }
             self.rows.push(Row {
-                kind,
+                kind: *kind,
                 cells: *cells,
                 emph_start: 0,
                 emph_len: 0,
@@ -689,15 +690,18 @@ mod tests {
     fn push_paired_allows_a_custom_pairing() {
         let mut b = AlignmentBuilder::new(2);
         // Pair left line 0 with right line 1, leaving right line 0 unmatched above it.
-        b.push_paired(
-            RowKind::Changed,
-            &[
+        b.push_paired(&[
+            (
+                RowKind::Unmatched,
                 [Cell::Filler, Cell::Line(LineNo(0)), Cell::Filler],
+            ),
+            (
+                RowKind::Changed,
                 [Cell::Line(LineNo(0)), Cell::Line(LineNo(1)), Cell::Filler],
-            ],
-        );
+            ),
+        ]);
         let a = b.finish();
-        assert_eq!(dump(&a), "   |  1 ~\n  1|  2 ~\n");
+        assert_eq!(dump(&a), "   |  1 +\n  1|  2 ~\n");
         assert_eq!(a.line_count(SideIdx::LEFT), 1);
         assert_eq!(a.line_count(SideIdx::RIGHT), 2);
     }

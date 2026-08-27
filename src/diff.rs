@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use similar::{Algorithm, ChangeTag, DiffOp, TextDiff};
 
-use crate::model::{Alignment, AlignmentBuilder, MAX_SIDES, RowKind, SideIdx};
+use crate::model::{Alignment, AlignmentBuilder, Cell, LineNo, MAX_SIDES, RowKind, SideIdx};
 use crate::text::{BinaryReason, EolStyle, FileContent, TextFile, files_equal};
 
 /// Default ceiling on the diff computation.
@@ -161,17 +161,34 @@ pub fn align_text(left: &TextFile, right: &TextFile, opts: &DiffOptions) -> Alig
                 new_index,
                 new_len,
             } => {
-                let block = b.push_block(RowKind::Changed, counts(old_len, new_len));
+                // Which lines belong opposite which is decided by similarity, not by
+                // position: see `layout_replace`.
+                let rows = layout_replace(
+                    old_index,
+                    &cmp_l[old_index..old_index + old_len],
+                    new_index,
+                    &cmp_r[new_index..new_index + new_len],
+                );
+                let block = b.push_paired(&rows);
                 if opts.inline {
-                    // Emphasise the rows that actually got paired, using the *original*
+                    // Emphasise only the rows that actually paired, using the *original*
                     // lines -- so the highlight lines up with what is drawn, whatever the
                     // whitespace mode did to the comparison.
-                    for k in 0..old_len.min(new_len) {
+                    for (offset, (kind, cells)) in rows.iter().enumerate() {
+                        let (Some(left), Some(right)) = (
+                            cells[SideIdx::LEFT.idx()].line(),
+                            cells[SideIdx::RIGHT.idx()].line(),
+                        ) else {
+                            continue;
+                        };
+                        if *kind != RowKind::Changed {
+                            continue;
+                        }
                         emphasize(
                             &mut b,
-                            block.start + k as u32,
-                            lo[old_index + k],
-                            ln[new_index + k],
+                            block.start + offset as u32,
+                            lo[left.0 as usize],
+                            ln[right.0 as usize],
                         );
                     }
                 }
@@ -506,8 +523,10 @@ mod tests {
 
     #[test]
     fn replace_with_unequal_counts_pads_the_shorter_side() {
+        // X pairs with P, and the two extra lines are additions rather than
+        // modifications of nothing -- a row with a filler side is never `Changed`.
         let a = align("a\nX\nz\n", "a\nP\nQ\nR\nz\n");
-        assert_eq!(dump(&a), " 1| 1 =\n 2| 2 ~\n  | 3 ~\n  | 4 ~\n 3| 5 =\n");
+        assert_eq!(dump(&a), " 1| 1 =\n 2| 2 ~\n  | 3 +\n  | 4 +\n 3| 5 =\n");
     }
 
     #[test]
@@ -753,5 +772,286 @@ mod whitespace_tests {
             covered.contains("alpha"),
             "emphasis covered {covered:?}, which is not the changed word"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Replace-block pairing
+// ---------------------------------------------------------------------------------------
+
+/// A pair below this similarity is not a modification of the same line, just two different
+/// lines that happen to be adjacent.
+const MIN_PAIR_RATIO: f32 = 0.4;
+
+/// Above this many candidate pairs, fall back to index order. The search is O(n*m) diffs,
+/// and a replace block that large is a rewrite where the pairing hardly matters.
+const PAIR_SEARCH_LIMIT: usize = 400;
+
+/// How alike two lines are, as a word-level ratio.
+fn similarity(old: &str, new: &str) -> f32 {
+    if old == new {
+        return 1.0;
+    }
+    // A blank line shares no words with anything, so this is mostly a shortcut -- but it
+    // also stops an added blank line from anchoring against real code.
+    if old.trim().is_empty() || new.trim().is_empty() {
+        return 0.0;
+    }
+    TextDiff::configure().diff_unicode_words(old, new).ratio()
+}
+
+/// Which lines of a replace block are modifications of each other.
+///
+/// Returns the index pairs, in order. Everything not paired is an insertion or a deletion.
+///
+/// Index order is only right when both sides changed in lockstep. As soon as one side
+/// gains a line, pairing by position makes the addition look like a modification of
+/// whatever happens to sit opposite it -- and worse, makes the line it really corresponds
+/// to look unmatched.
+fn anchor_pairs(old: &[&str], new: &[&str]) -> Vec<(usize, usize)> {
+    let (n, m) = (old.len(), new.len());
+    if n == 0 || m == 0 || n * m > PAIR_SEARCH_LIMIT {
+        return Vec::new();
+    }
+
+    // Best total similarity obtainable from (i, j) onwards, and how it was reached.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        Pair,
+        SkipOld,
+        SkipNew,
+    }
+    let mut score = vec![vec![0f32; m + 1]; n + 1];
+    let mut step = vec![vec![Step::SkipOld; m + 1]; n + 1];
+
+    for i in (0..=n).rev() {
+        for j in (0..=m).rev() {
+            if i == n && j == m {
+                continue;
+            }
+            let mut best = f32::NEG_INFINITY;
+            let mut pick = Step::SkipOld;
+            if i < n && score[i + 1][j] > best {
+                best = score[i + 1][j];
+                pick = Step::SkipOld;
+            }
+            if j < m && score[i][j + 1] > best {
+                best = score[i][j + 1];
+                pick = Step::SkipNew;
+            }
+            if i < n && j < m {
+                let ratio = similarity(old[i], new[j]);
+                // Strictly better, so an equally-good pairing loses to leaving the lines
+                // unmatched -- which reads more honestly.
+                if ratio >= MIN_PAIR_RATIO && ratio + score[i + 1][j + 1] > best {
+                    best = ratio + score[i + 1][j + 1];
+                    pick = Step::Pair;
+                }
+            }
+            score[i][j] = best;
+            step[i][j] = pick;
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n || j < m {
+        match step[i][j] {
+            Step::Pair => {
+                pairs.push((i, j));
+                i += 1;
+                j += 1;
+            }
+            Step::SkipOld => i += 1,
+            Step::SkipNew => j += 1,
+        }
+    }
+    pairs
+}
+
+/// Lay a replace block out as rows.
+///
+/// Anchored pairs line up; the leftovers between two anchors are zipped index-wise, which
+/// keeps a wholly rewritten block as compact as it was before. A row with a filler on one
+/// side is `Unmatched`, never `Changed`: it is an addition or a deletion, and the marker
+/// column has to say so.
+fn layout_replace(
+    old_index: usize,
+    old: &[&str],
+    new_index: usize,
+    new: &[&str],
+) -> Vec<(RowKind, [Cell; MAX_SIDES])> {
+    let cell = |base: usize, offset: usize| Cell::Line(LineNo((base + offset) as u32));
+    let mut rows = Vec::new();
+
+    let emit_gap = |rows: &mut Vec<(RowKind, [Cell; MAX_SIDES])>,
+                    old_range: std::ops::Range<usize>,
+                    new_range: std::ops::Range<usize>| {
+        let height = old_range.len().max(new_range.len());
+        for k in 0..height {
+            let mut cells = [Cell::Filler; MAX_SIDES];
+            let has_old = k < old_range.len();
+            let has_new = k < new_range.len();
+            if has_old {
+                cells[SideIdx::LEFT.idx()] = cell(old_index, old_range.start + k);
+            }
+            if has_new {
+                cells[SideIdx::RIGHT.idx()] = cell(new_index, new_range.start + k);
+            }
+            let kind = if has_old && has_new {
+                RowKind::Changed
+            } else {
+                RowKind::Unmatched
+            };
+            rows.push((kind, cells));
+        }
+    };
+
+    let (mut i, mut j) = (0, 0);
+    for (pi, pj) in anchor_pairs(old, new) {
+        emit_gap(&mut rows, i..pi, j..pj);
+        let mut cells = [Cell::Filler; MAX_SIDES];
+        cells[SideIdx::LEFT.idx()] = cell(old_index, pi);
+        cells[SideIdx::RIGHT.idx()] = cell(new_index, pj);
+        rows.push((RowKind::Changed, cells));
+        i = pi + 1;
+        j = pj + 1;
+    }
+    emit_gap(&mut rows, i..old.len(), j..new.len());
+    rows
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+    use crate::text::decode;
+    use std::path::Path;
+
+    fn file(body: &str) -> TextFile {
+        decode(Path::new("t"), body.as_bytes().to_vec(), None)
+    }
+
+    /// Render as `left | right kind`, which is what the user actually sees.
+    fn layout(left: &str, right: &str) -> String {
+        let (l, r) = (file(left), file(right));
+        let a = align_text(&l, &r, &DiffOptions::default());
+        a.rows()
+            .iter()
+            .map(|row| {
+                let show = |c: Cell, f: &TextFile| {
+                    c.line()
+                        .map_or_else(|| "~".to_string(), |n| f.line(n).to_string())
+                };
+                let kind = match row.kind {
+                    RowKind::Equal => "=",
+                    RowKind::Changed => "~",
+                    RowKind::Conflict => "!",
+                    RowKind::Unmatched => {
+                        if row.cells[0].is_filler() {
+                            "+"
+                        } else {
+                            "-"
+                        }
+                    }
+                };
+                format!(
+                    "{}|{} {kind}\n",
+                    show(row.cells[0], &l),
+                    show(row.cells[1], &r)
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_line_inserted_before_a_changed_one_is_not_paired_with_it() {
+        // The bug this fixes: "zzz" was shown opposite "let x = 1;" and the line that
+        // really corresponds to it was left looking unmatched.
+        assert_eq!(
+            layout("a\nzzz\nlet x = 2;\nb\n", "a\nlet x = 1;\nb\n"),
+            "a|a =\nzzz|~ -\nlet x = 2;|let x = 1; ~\nb|b =\n"
+        );
+    }
+
+    #[test]
+    fn an_added_blank_line_anchors_against_nothing() {
+        assert_eq!(
+            layout("a\n\nlet x = 2;\n", "a\nlet x = 1;\n"),
+            "a|a =\n|~ -\nlet x = 2;|let x = 1; ~\n"
+        );
+    }
+
+    #[test]
+    fn several_added_lines_before_a_change_stay_additions() {
+        assert_eq!(
+            layout("a\nN1\nN2\nvalue = 9\nb\n", "a\nvalue = 1\nb\n"),
+            "a|a =\nN1|~ -\nN2|~ -\nvalue = 9|value = 1 ~\nb|b =\n"
+        );
+    }
+
+    #[test]
+    fn a_line_removed_before_a_change_is_a_deletion() {
+        assert_eq!(
+            layout("a\nvalue = 1\nb\n", "a\nGONE\nvalue = 9\nb\n"),
+            "a|a =\n~|GONE +\nvalue = 1|value = 9 ~\nb|b =\n"
+        );
+    }
+
+    #[test]
+    fn a_wholly_rewritten_block_stays_compact() {
+        // Nothing pairs, so the old index-order zip still applies: three rows, not six.
+        assert_eq!(
+            layout("a\nqqq\nwww\neee\nb\n", "a\n111\n222\n333\nb\n"),
+            "a|a =\nqqq|111 ~\nwww|222 ~\neee|333 ~\nb|b =\n"
+        );
+    }
+
+    #[test]
+    fn lockstep_changes_still_pair_by_position() {
+        assert_eq!(
+            layout("let a = 1;\nlet b = 2;\n", "let a = 9;\nlet b = 8;\n"),
+            "let a = 1;|let a = 9; ~\nlet b = 2;|let b = 8; ~\n"
+        );
+    }
+
+    #[test]
+    fn a_filler_row_is_never_marked_as_a_change() {
+        let (l, r) = (file("a\nX\nz\n"), file("a\nP\nQ\nR\nz\n"));
+        let a = align_text(&l, &r, &DiffOptions::default());
+        for (i, row) in a.rows().iter().enumerate() {
+            let has_filler = row.cells[..2].iter().any(|c| c.is_filler());
+            assert!(
+                !(has_filler && row.kind == RowKind::Changed),
+                "row {i} has a filler side but claims to be a modification"
+            );
+        }
+    }
+
+    #[test]
+    fn emphasis_lands_on_the_paired_row_not_the_inserted_one() {
+        let (l, r) = (file("a\nzzz\nlet x = 2;\n"), file("a\nlet x = 1;\n"));
+        let a = align_text(&l, &r, &DiffOptions::default());
+        // Row 1 is the insertion; row 2 is the real modification.
+        assert_eq!(a.emphasis(1, SideIdx::LEFT).count(), 0);
+        assert!(a.emphasis(2, SideIdx::LEFT).count() > 0);
+    }
+
+    #[test]
+    fn a_very_large_replace_block_falls_back_without_hanging() {
+        // Past the search limit the pairing is index order again, which is fine: a block
+        // that big is a rewrite.
+        let left: String = (0..40).map(|i| format!("old line {i}\n")).collect();
+        let right: String = (0..40).map(|i| format!("new line {i}\n")).collect();
+        let a = align_text(&file(&left), &file(&right), &DiffOptions::default());
+        assert_eq!(a.len(), 40, "should stay one row per pair");
+    }
+
+    #[test]
+    fn similarity_scores_what_it_should() {
+        assert_eq!(similarity("same", "same"), 1.0);
+        assert_eq!(similarity("", "let x = 1;"), 0.0);
+        assert_eq!(similarity("   ", "let x = 1;"), 0.0);
+        assert!(similarity("let x = 1;", "let x = 2;") > MIN_PAIR_RATIO);
+        assert!(similarity("zzz", "let x = 1;") < MIN_PAIR_RATIO);
     }
 }

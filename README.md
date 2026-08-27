@@ -139,6 +139,12 @@ be edited -- there are no lines to copy -- and say so.
   easily be a diff that has not loaded. It clears on the first keystroke, and that
   keystroke still does its normal job -- so `Esc` goes straight back to the directory
   view. When the match depends on a flag, the caveat is on the panel too.
+- **Lines are paired by similarity, not by position.** Inside a changed block, yadt works
+  out which line is a modification of which; anything left over is shown as a plain
+  addition or deletion with nothing opposite it. Pairing by position would make a line
+  inserted before a change look like a modification of whatever happened to sit opposite,
+  and leave its real counterpart looking orphaned. A block where nothing pairs stays as
+  compact as before.
 - **Search** is smart-case: a lower-case query matches any case, a query with a capital
   matches exactly. `n`/`p` stay bound to hunks and matches are on `N`/`P`, so there are no
   modes -- both work at once. A hit hidden inside a fold expands it.

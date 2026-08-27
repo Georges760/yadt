@@ -890,9 +890,9 @@ mod render_tests {
         assert_eq!(lines[0], "a.txt            b.txt");
         assert_eq!(lines[1], "  1 same           1 same");
         assert_eq!(lines[2], "  2 old        \u{25ac}   2 new");
-        // similar folds "old"->"new" and the added "extra" into a single replace op, so
-        // this row is Changed with a filler on the left rather than a separate insert.
-        assert_eq!(lines[3], "               \u{25ac}   3 extra");
+        // similar folds "old"->"new" and the added "extra" into one replace op, but the
+        // row with a filler on the left is still an insertion, and the marker says so.
+        assert_eq!(lines[3], "               \u{25b6}   3 extra");
         assert_eq!(lines[4], "  3 tail           4 tail");
         assert!(lines[6].contains("row 1/4"), "status was {:?}", lines[6]);
     }
