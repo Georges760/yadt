@@ -210,3 +210,7 @@ nix flake check       # builds and tests, then clippy and rustfmt
 
 Dependencies are vendored from the checked-in `Cargo.lock`, so nothing has to be
 re-hashed when they change.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

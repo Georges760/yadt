@@ -43,6 +43,7 @@
 
           meta = {
             description = "Terminal diff tool for two files or two directory trees";
+            license = lib.licenses.mit;
             mainProgram = "yadt";
             platforms = lib.platforms.unix;
           };
