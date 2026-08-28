@@ -196,3 +196,17 @@ The toolchain comes from Nix via [devenv](https://devenv.sh/); `direnv allow` (o
 cargo build --release
 cargo test
 ```
+
+### With Nix
+
+The crate is also a flake, so it builds on a host with no Rust toolchain:
+
+```bash
+nix build             # ./result/bin/yadt
+nix run . -- A B      # build and run in one step
+nix develop           # cargo, clippy, rustfmt and rust-analyzer on the path
+nix flake check       # builds and tests, then clippy and rustfmt
+```
+
+Dependencies are vendored from the checked-in `Cargo.lock`, so nothing has to be
+re-hashed when they change.
