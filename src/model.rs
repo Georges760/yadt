@@ -241,12 +241,11 @@ impl Alignment {
     /// hunk it gives the range to replace, and it degenerates correctly to an empty range
     /// at the right insertion point when the side has no lines in the hunk at all.
     pub fn line_at_or_after(&self, row: usize, side: SideIdx) -> u32 {
-        for r in row..self.rows.len() {
-            if let Cell::Line(n) = self.rows[r].cells[side.idx()] {
-                return n.0;
-            }
-        }
-        self.line_counts[side.idx()]
+        self.rows
+            .iter()
+            .skip(row)
+            .find_map(|r| r.cells[side.idx()].line())
+            .map_or(self.line_counts[side.idx()], |n| n.0)
     }
 
     /// True when the two sides are the same all the way down.

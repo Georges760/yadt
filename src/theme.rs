@@ -1,8 +1,7 @@
 //! Colours. Kept in one place because this is the file edited constantly while tuning.
 
-use ratatui::style::{Color, Modifier, Style};
-
 use crate::model::{Cell, RowKind};
+use crate::style::{Color, Modifier, Style};
 
 /// Background of the selected row when the row has no colour of its own.
 const CURSOR_BG: Color = Color::Rgb(52, 52, 64);
@@ -45,22 +44,22 @@ impl Theme {
             filler: Style::new().bg(Color::Rgb(24, 24, 28)),
             emph_added: Style::new().bg(Color::Rgb(35, 100, 45)),
             emph_removed: Style::new().bg(Color::Rgb(110, 40, 45)),
-            gutter: Style::new().fg(Color::DarkGray),
-            gutter_active: Style::new().fg(Color::Gray),
-            header: Style::new().fg(Color::Gray),
-            header_focus: Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            status: Style::new().fg(Color::Gray),
-            marker: Style::new().fg(Color::DarkGray),
+            gutter: Style::new().fg(Color::DARK_GRAY),
+            gutter_active: Style::new().fg(Color::GRAY),
+            header: Style::new().fg(Color::GRAY),
+            header_focus: Style::new().fg(Color::WHITE).add_modifier(Modifier::BOLD),
+            status: Style::new().fg(Color::GRAY),
+            marker: Style::new().fg(Color::DARK_GRAY),
             fold: Style::new()
-                .fg(Color::DarkGray)
+                .fg(Color::DARK_GRAY)
                 .bg(Color::Rgb(22, 22, 26))
                 .add_modifier(Modifier::ITALIC),
-            search: Style::new().bg(Color::Rgb(90, 80, 20)).fg(Color::White),
+            search: Style::new().bg(Color::Rgb(90, 80, 20)).fg(Color::WHITE),
             search_current: Style::new()
                 .bg(Color::Rgb(200, 160, 40))
-                .fg(Color::Black)
+                .fg(Color::BLACK)
                 .add_modifier(Modifier::BOLD),
-            warning: Style::new().fg(Color::Yellow),
+            warning: Style::new().fg(Color::YELLOW),
             identical: Style::new()
                 .fg(Color::Rgb(120, 220, 140))
                 .add_modifier(Modifier::BOLD),
@@ -196,7 +195,7 @@ mod tests {
     fn the_monochrome_theme_falls_back_to_reverse_video() {
         let theme = Theme::no_color();
         let selected = theme.cursor(theme.equal);
-        assert!(selected.add_modifier.contains(Modifier::REVERSED));
+        assert!(selected.modifiers.contains(Modifier::REVERSED));
         assert_eq!(selected.bg, None, "no colour means no background to lift");
     }
 

@@ -5,13 +5,18 @@
 //! it is comparing.
 
 pub mod app;
+pub mod canvas;
 pub mod diff;
 pub mod dirdiff;
 pub mod edit;
 pub mod hex;
+pub mod key;
 pub mod model;
 pub mod pane;
 pub mod search;
+pub mod style;
+#[cfg(test)]
+mod testing;
 pub mod text;
 pub mod theme;
 pub mod ui;

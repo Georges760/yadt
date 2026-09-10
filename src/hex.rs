@@ -10,8 +10,10 @@
 //! reports, and honest about what it is. Recovering from insertions would need a
 //! content-defined chunking pass, which is a different tool.
 
+use crate::canvas::Canvas;
 use crate::model::{Alignment, AlignmentBuilder, MAX_SIDES, RowKind, SideIdx};
 use crate::pane::Overlay;
+use crate::style::Style;
 
 /// Bytes per row. Eight keeps a side-by-side pair inside a normal terminal; sixteen is the
 /// classic `hexdump -C` width and wants a wide one.
@@ -204,7 +206,7 @@ pub fn format_row(bytes: &[u8], layout: Layout) -> String {
 pub fn overlays(
     positions: impl Iterator<Item = (u32, u32)>,
     layout: Layout,
-    style: ratatui::style::Style,
+    style: Style,
 ) -> Vec<Overlay> {
     let mut out = Vec::new();
     for (start, end) in positions {
@@ -255,22 +257,23 @@ pub struct HexPane<'a> {
     pub focused: bool,
 }
 
-impl ratatui::widgets::Widget for HexPane<'_> {
-    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+impl HexPane<'_> {
+    /// Draw the pane into a canvas exactly its size.
+    pub fn render(self, width: u16, height: u16) -> Canvas {
         use crate::model::{Cell, ViewRow};
 
-        if area.width == 0 || area.height == 0 {
-            return;
+        let mut canvas = Canvas::new(width, height);
+        if width == 0 || height == 0 {
+            return canvas;
         }
         let side_is_left = self.side == SideIdx::LEFT;
-        let gutter = self.gutter_width.min(area.width);
-        let text_x = area.x.saturating_add(gutter).saturating_add(1);
-        let text_width = area.width.saturating_sub(gutter + 1);
+        let gutter = self.gutter_width.min(width);
+        let text_x = gutter.saturating_add(1);
+        let text_width = width.saturating_sub(gutter + 1);
         let layout = Layout::for_width(self.per_row, text_width);
 
-        for dy in 0..area.height {
-            let view_index = self.top + dy as usize;
-            let y = area.y + dy;
+        for y in 0..height {
+            let view_index = self.top + y as usize;
             let Some(view_row) = self.rows.get(view_index).copied() else {
                 break;
             };
@@ -290,15 +293,7 @@ impl ratatui::widgets::Widget for HexPane<'_> {
                 style = self.theme.cursor(style);
             }
 
-            buf.set_style(
-                ratatui::layout::Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: 1,
-                },
-                style,
-            );
+            canvas.fill(0, y, width, style);
 
             if let ViewRow::Fold { start, end } = view_row {
                 let hidden = u64::from(end - start) * u64::from(self.per_row);
@@ -307,7 +302,7 @@ impl ratatui::widgets::Widget for HexPane<'_> {
                     "",
                     width = gutter as usize
                 );
-                buf.set_stringn(area.x, y, &label, area.width as usize, style);
+                canvas.print(0, y, &label, width, style);
                 continue;
             }
 
@@ -319,13 +314,7 @@ impl ratatui::widgets::Widget for HexPane<'_> {
                     self.theme.gutter
                 };
                 let label = format!("{:0>width$x}", offset, width = gutter as usize);
-                buf.set_stringn(
-                    area.x,
-                    y,
-                    &label,
-                    gutter as usize,
-                    style.patch(gutter_style),
-                );
+                canvas.print(0, y, &label, gutter, style.patch(gutter_style));
 
                 if text_width > 0 {
                     let start = offset as usize;
@@ -346,7 +335,7 @@ impl ratatui::widgets::Widget for HexPane<'_> {
                     );
 
                     crate::pane::draw_line(
-                        buf,
+                        &mut canvas,
                         text_x,
                         y,
                         text_width,
@@ -360,13 +349,14 @@ impl ratatui::widgets::Widget for HexPane<'_> {
                 }
             }
         }
+        canvas
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Cell;
-    use ratatui::style::Style;
 
     fn dump(a: &Alignment) -> String {
         a.rows()

@@ -1,5 +1,8 @@
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -153,22 +156,66 @@ fn run() -> Result<i32> {
         return Ok(app.exit_code_blocking());
     }
 
-    // `run` restores the terminal on every path out: normal return, the `?` below, and a
-    // panic (via the hook it installs).
-    ratatui::run(|terminal| app::run_app(terminal, &mut app))?;
+    run_tui(&mut app)?;
 
     Ok(app.exit_code())
+}
+
+/// Run the TUI, holding any panic report back until the terminal is restored.
+///
+/// The blit session restores the terminal on every path out of `run_app`, a panic unwinding
+/// through it included. But the panic hook runs first, while the alternate screen is still
+/// up, and whatever it prints vanishes with that screen. So the report is kept and printed
+/// afterwards — along with one from the scan thread, which would otherwise scribble over
+/// the diff mid-session.
+fn run_tui(app: &mut App) -> Result<()> {
+    static REPORT: Mutex<Option<String>> = Mutex::new(None);
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let backtrace = Backtrace::capture();
+        let trace = match backtrace.status() {
+            BacktraceStatus::Captured => backtrace.to_string(),
+            _ => "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+                .to_string(),
+        };
+        let report = format!(
+            "thread '{}' {info}\n{trace}",
+            thread.name().unwrap_or("<unnamed>")
+        );
+        REPORT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(report);
+    }));
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| app::run_app(app)));
+    std::panic::set_hook(default_hook);
+
+    if let Some(report) = REPORT.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        eprintln!("{report}");
+    }
+    outcome.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 /// Bytes per hex row for the terminal as it is right now.
 ///
 /// Done before the alternate screen is entered and before the files are read, so a large
 /// binary is aligned at the right width once rather than being re-aligned on the first
-/// draw. Falls back to the default if the size cannot be determined — output may be piped.
+/// draw. Falls back to the default if the size cannot be determined — there may be no
+/// terminal at all.
 fn initial_hex_width() -> u32 {
-    crossterm::terminal::size().map_or(yadt::hex::DEFAULT_BYTES_PER_ROW, |(cols, _)| {
+    terminal_columns().map_or(yadt::hex::DEFAULT_BYTES_PER_ROW, |cols| {
         // A generous gutter guess: being one step conservative costs less than being wrong
         // the other way, and small files get corrected at draw time anyway.
         yadt::hex::fit_bytes_per_row(yadt::hex::pane_row_width(cols, 8))
     })
+}
+
+/// The controlling terminal's width. Asked of `/dev/tty`, because that is the terminal blit
+/// draws on, whatever stdout has been redirected to.
+fn terminal_columns() -> Option<u16> {
+    let tty = std::fs::File::open("/dev/tty").ok()?;
+    let size = rustix::termios::tcgetwinsize(&tty).ok()?;
+    (size.ws_col > 0).then_some(size.ws_col)
 }

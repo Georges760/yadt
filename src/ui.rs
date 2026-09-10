@@ -1,44 +1,96 @@
-//! Layout and rendering. Free functions taking a `Frame`, per the house pattern.
+//! Layout and rendering: free functions that describe one blit frame.
+//!
+//! blit lays a frame out after the tree has been built, but yadt needs the body's height
+//! *while* building, to clamp the scroll position before choosing which rows to draw. So the
+//! screen is divided here with plain arithmetic, the views are clamped against those numbers,
+//! and each region is placed at exactly that rectangle with `layout::rect`. What the clamp
+//! assumed and where the rows land cannot disagree, because they are the same numbers.
+//!
+//! Anything that carries a background across a pane is painted cell by cell through a
+//! [`Canvas`]. One-line chrome, panels and the help overlay are blit's `Text` and `Block`.
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
+use blit::state;
+use blit_tui::Ui;
+use blit_tui::atom::Border;
+use blit_tui::color::Color as TermColor;
+use blit_tui::layout::rect;
+use blit_tui::text::{Span, TextOptions, TextWrap};
+use blit_tui::widget::{Block, Text, Title};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, DirView, FileView, View};
+use crate::canvas::{self, Canvas};
 use crate::diff::human_size;
 use crate::dirdiff::{EntryKind, EntryStatus};
 use crate::hex;
 use crate::model::{Cell, RowKind, SideIdx};
 use crate::pane::DiffPane;
+use crate::style::Style;
 use crate::text::{FileContent, TextFile};
 use crate::theme::Theme;
 
 /// Width of the column between the two panes.
 const MARKER_WIDTH: u16 = 3;
 
+/// The frame's root node, which puts each child at an exact rectangle.
+type Root<'a> = Ui<'a, state::Open<rect::Layout>>;
+
+/// A region of the screen, in whole cells.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl Rect {
+    const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// What is left inside a one-cell border.
+    const fn inner(self) -> Self {
+        Self {
+            x: self.x.saturating_add(1),
+            y: self.y.saturating_add(1),
+            width: self.width.saturating_sub(2),
+            height: self.height.saturating_sub(2),
+        }
+    }
+}
+
+impl From<Rect> for blit::Rect {
+    fn from(area: Rect) -> Self {
+        Self::new(
+            f32::from(area.x),
+            f32::from(area.y),
+            f32::from(area.width),
+            f32::from(area.height),
+        )
+    }
+}
+
 /// Takes `&mut App` because scroll clamping happens here — doing it anywhere else leaves
 /// one frame of garbage after a resize or a view push.
-pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    let (header, body, status) = (chunks[0], chunks[1], chunks[2]);
+pub fn draw(ui: Ui<'_>, app: &mut App) {
+    let screen = ui.screen();
+    let area = Rect::new(0, 0, cells(screen.width), cells(screen.height));
+    let [header, body, status] = screen_rows(area);
     let theme = app.theme;
     let tab_width = app.opts.tab_width;
     let message = app.status.clone();
+    let mut root = ui.layout(rect::layout());
 
     match app.views.last_mut() {
         Some(View::File(view)) => {
-            view.clamp(body);
+            view.clamp(body.height);
             if view.cmp.hex.is_some() {
                 // The gutter is sized from the file, so what is left for the row is
                 // whatever the pane has after it.
@@ -46,39 +98,40 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 let gutter = hex_gutter_width(view);
                 view.fit_hex_width(pane.width.saturating_sub(gutter + 1));
             }
-            draw_file_header(frame, header, view, &theme);
-            draw_file_body(frame, body, view, &theme, tab_width);
-            draw_file_status(frame, status, view, &theme, &message);
+            draw_file_header(&mut root, header, view, &theme);
+            draw_file_body(&mut root, body, view, &theme, tab_width);
+            draw_file_status(&mut root, status, view, &theme, &message);
         }
         Some(View::Dir(view)) => {
-            view.clamp(body);
-            draw_dir_header(frame, header, view, &theme);
-            draw_dir_body(frame, body, view, &theme);
-            draw_dir_status(frame, status, view, &theme, &message);
+            view.clamp(body.height);
+            draw_dir_header(&mut root, header, view, &theme);
+            draw_dir_body(&mut root, body, view, &theme);
+            draw_dir_status(&mut root, status, view, &theme, &message);
         }
         None => {}
     }
 
     if let Some(prompt) = app.prompt.as_ref() {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(prompt.label.to_string(), theme.header_focus),
-                Span::styled(prompt.buffer.clone(), theme.status),
-                Span::styled("\u{2588}".to_string(), theme.header_focus),
-            ])),
+        line(
+            &mut root,
             status,
+            &[
+                (prompt.label, theme.header_focus),
+                (prompt.buffer.as_str(), theme.status),
+                ("\u{2588}", theme.header_focus),
+            ],
         );
     }
 
     if let Some(View::File(view)) = app.views.last()
         && view.notice
     {
-        draw_identical_notice(frame, body, view, &theme);
+        draw_identical_notice(&mut root, body, view, &theme);
     }
 
     if app.help_visible {
         draw_help(
-            frame,
+            &mut root,
             area,
             &theme,
             matches!(app.views.last(), Some(View::Dir(_))),
@@ -86,17 +139,64 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// A frame extent in whole cells. blit measures in `f32`; a terminal does not.
+fn cells(extent: f32) -> u16 {
+    extent.clamp(0.0, f32::from(u16::MAX)) as u16
+}
+
+// ---------------------------------------------------------------------------------------
+// Placing things on screen
+// ---------------------------------------------------------------------------------------
+
+/// Put a canvas on screen at `area`.
+fn place(root: &mut Root<'_>, area: Rect, canvas: Canvas) {
+    root.child(area.into()).insert(canvas);
+}
+
+/// One line of styled parts along the top of `area`, clipped to its width.
+fn line(root: &mut Root<'_>, area: Rect, parts: &[(&str, Style)]) {
+    let spans: Vec<Span<'_>> = parts
+        .iter()
+        .map(|&(text, style)| canvas::span(text, style))
+        .collect();
+    root.child(area.into()).insert(Text::rich(&spans));
+}
+
+/// Lines of styled parts, filling `area` from the top.
+fn paragraph(root: &mut Root<'_>, area: Rect, lines: &[Vec<(String, Style)>], wrap: TextWrap) {
+    let mut spans = Vec::new();
+    for (i, parts) in lines.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::new("\n"));
+        }
+        spans.extend(parts.iter().map(|(text, style)| canvas::span(text, *style)));
+    }
+    root.child(area.into())
+        .insert(Text::rich(&spans).options(TextOptions::new().wrap(wrap)));
+}
+
+/// A bordered panel, cleared first so nothing beneath shows through it.
+fn panel(root: &mut Root<'_>, area: Rect, title: Option<&str>) {
+    let mut block = Block::new()
+        .background(TermColor::Reset)
+        .border(Border::new(TermColor::Reset));
+    if let Some(title) = title {
+        block = block.title(Title::new(title));
+    }
+    root.child(area.into()).insert(block);
+}
+
 // ---------------------------------------------------------------------------------------
 // Directory view
 // ---------------------------------------------------------------------------------------
 
-fn draw_dir_header(frame: &mut Frame<'_>, area: Rect, view: &DirView, theme: &Theme) {
+fn draw_dir_header(root: &mut Root<'_>, area: Rect, view: &DirView, theme: &Theme) {
     let [left, _, right] = pane_columns(area);
-    render_path(frame, left, &view.roots[0], false, theme);
-    render_path(frame, right, &view.roots[1], false, theme);
+    render_path(root, left, &view.roots[0], false, theme);
+    render_path(root, right, &view.roots[1], false, theme);
 }
 
-fn draw_dir_body(frame: &mut Frame<'_>, area: Rect, view: &mut DirView, theme: &Theme) {
+fn draw_dir_body(root: &mut Root<'_>, area: Rect, view: &mut DirView, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -112,10 +212,8 @@ fn draw_dir_body(frame: &mut Frame<'_>, area: Rect, view: &mut DirView, theme: &
         } else {
             "scanning\u{2026}".to_string()
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {text}"), theme.status))),
-            area,
-        );
+        let text = format!(" {text}");
+        line(root, area, &[(text.as_str(), theme.status)]);
         return;
     }
 
@@ -123,36 +221,19 @@ fn draw_dir_body(frame: &mut Frame<'_>, area: Rect, view: &mut DirView, theme: &
     // row by row, with the marker column between. A name missing on one side leaves that
     // pane blank, so reading down one column tells you what that tree actually contains.
     let [left, marker, right] = pane_columns(area);
-    draw_dir_pane(
-        frame,
-        left,
-        view,
-        &visible,
-        top,
-        cursor,
-        SideIdx::LEFT,
-        theme,
-    );
-    draw_dir_pane(
-        frame,
-        right,
-        view,
-        &visible,
-        top,
-        cursor,
-        SideIdx::RIGHT,
-        theme,
-    );
-    draw_dir_markers(frame, marker, view, &visible, top, cursor, theme);
+    for (side, pane) in [(SideIdx::LEFT, left), (SideIdx::RIGHT, right)] {
+        let canvas = dir_pane(pane, view, &visible, top, cursor, side, theme);
+        place(root, pane, canvas);
+    }
+    let canvas = dir_markers(marker, view, &visible, top, cursor, theme);
+    place(root, marker, canvas);
 }
 
 /// One side of the directory tree.
 ///
 /// Rows a side does not hold render as blank filler, which is what keeps the two panes
 /// aligned: row `i` is the same entry in both, exactly as in the file view.
-#[allow(clippy::too_many_arguments)]
-fn draw_dir_pane(
-    frame: &mut Frame<'_>,
+fn dir_pane(
     area: Rect,
     view: &DirView,
     visible: &[usize],
@@ -160,19 +241,16 @@ fn draw_dir_pane(
     cursor: usize,
     side: SideIdx,
     theme: &Theme,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
+) -> Canvas {
+    let mut canvas = Canvas::new(area.width, area.height);
     let width = area.width as usize;
-    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
-
-    for (offset, &row_index) in visible
+    let rows = visible
         .iter()
         .enumerate()
         .skip(top)
-        .take(area.height as usize)
-    {
+        .take(area.height as usize);
+
+    for (y, (offset, &row_index)) in (0u16..).zip(rows) {
         let row = &view.rows[row_index];
         let present = row.present[side.idx()];
 
@@ -210,40 +288,36 @@ fn draw_dir_pane(
         if offset == cursor {
             style = theme.cursor(style);
         }
-        lines.push(Line::from(Span::styled(text, style)));
+        canvas.print(0, y, &text, area.width, style);
     }
-
-    frame.render_widget(Paragraph::new(lines), area);
+    canvas
 }
 
 /// The column between the panes. With colour off this carries the entire diff.
-#[allow(clippy::too_many_arguments)]
-fn draw_dir_markers(
-    frame: &mut Frame<'_>,
+fn dir_markers(
     area: Rect,
     view: &DirView,
     visible: &[usize],
     top: usize,
     cursor: usize,
     theme: &Theme,
-) {
-    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
-    for (offset, &row_index) in visible
+) -> Canvas {
+    let mut canvas = Canvas::new(area.width, area.height);
+    let rows = visible
         .iter()
         .enumerate()
         .skip(top)
-        .take(area.height as usize)
-    {
+        .take(area.height as usize);
+
+    for (y, (offset, &row_index)) in (0u16..).zip(rows) {
         let mut style = theme.marker;
         if offset == cursor {
             style = theme.cursor(style);
         }
-        lines.push(Line::from(Span::styled(
-            format!(" {} ", view.rows[row_index].status.glyph()),
-            style,
-        )));
+        let text = format!(" {} ", view.rows[row_index].status.glyph());
+        canvas.print(0, y, &text, area.width, style);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    canvas
 }
 
 /// Lay `left` and `right` across `width` display columns with `right` flush to the end,
@@ -290,7 +364,7 @@ fn status_style(status: EntryStatus, theme: &Theme) -> Style {
 }
 
 fn draw_dir_status(
-    frame: &mut Frame<'_>,
+    root: &mut Root<'_>,
     area: Rect,
     view: &mut DirView,
     theme: &Theme,
@@ -320,16 +394,15 @@ fn draw_dir_status(
     parts.push("? help".to_string());
     parts.push("q quit".to_string());
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {}", parts.join(" \u{b7} ")),
-            theme.status,
-        ))),
-        area,
-    );
+    let text = format!(" {}", parts.join(" \u{b7} "));
+    line(root, area, &[(text.as_str(), theme.status)]);
 }
 
-fn draw_file_header(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
+// ---------------------------------------------------------------------------------------
+// File view
+// ---------------------------------------------------------------------------------------
+
+fn draw_file_header(root: &mut Root<'_>, area: Rect, view: &FileView, theme: &Theme) {
     let [left, _, right] = pane_columns(area);
     let focus = view.focus;
     for (side, area) in [(SideIdx::LEFT, left), (SideIdx::RIGHT, right)] {
@@ -340,17 +413,16 @@ fn draw_file_header(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &
         };
         // A side with unsaved changes is marked, so nothing is edited invisibly.
         if view.dirty[side.idx()] {
-            let style = theme.warning;
             let text = truncate_left(&format!("\u{25cf} {}", path.display()), area.width as usize);
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+            line(root, area, &[(text.as_str(), theme.warning)]);
         } else {
-            render_path(frame, area, path, focus == side, theme);
+            render_path(root, area, path, focus == side, theme);
         }
     }
 }
 
 fn render_path(
-    frame: &mut Frame<'_>,
+    root: &mut Root<'_>,
     area: Rect,
     path: &std::path::Path,
     focused: bool,
@@ -362,7 +434,7 @@ fn render_path(
         theme.header
     };
     let text = truncate_left(&path.display().to_string(), area.width as usize);
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+    line(root, area, &[(text.as_str(), style)]);
 }
 
 /// Truncate from the left, so the filename always survives.
@@ -378,15 +450,9 @@ fn truncate_left(s: &str, width: usize) -> String {
     format!("\u{2026}{tail}")
 }
 
-fn draw_file_body(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    view: &FileView,
-    theme: &Theme,
-    tab_width: u8,
-) {
+fn draw_file_body(root: &mut Root<'_>, area: Rect, view: &FileView, theme: &Theme, tab_width: u8) {
     let Some(alignment) = view.cmp.alignment.as_ref() else {
-        draw_not_diffable(frame, area, view, theme);
+        draw_not_diffable(root, area, view, theme);
         return;
     };
     let text_sides = view.cmp.texts();
@@ -395,97 +461,96 @@ fn draw_file_body(
         .hex
         .zip(view.cmp.left.as_binary().zip(view.cmp.right.as_binary()));
     if text_sides.is_none() && hex_sides.is_none() {
-        draw_not_diffable(frame, area, view, theme);
+        draw_not_diffable(root, area, view, theme);
         return;
     }
 
     // A banner steals one row off the top when there is something the rows cannot say.
-    let (banner, body) = match &view.cmp.note {
+    let body = match &view.cmp.note {
         Some(note) => {
-            let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(format!(" {note}"), theme.warning))),
-                rows[0],
-            );
-            (Some(rows[0]), rows[1])
+            let banner = Rect {
+                height: area.height.min(1),
+                ..area
+            };
+            let text = format!(" {note}");
+            line(root, banner, &[(text.as_str(), theme.warning)]);
+            Rect {
+                y: area.y + banner.height,
+                height: area.height - banner.height,
+                ..area
+            }
         }
-        None => (None, area),
+        None => area,
     };
-    let _ = banner;
 
     let [left, marker, right] = pane_columns(body);
+    let panes = [(SideIdx::LEFT, left), (SideIdx::RIGHT, right)];
 
     if let Some((per_row, (left_bytes, right_bytes))) = hex_sides {
         // A hex row is a chunk of bytes rather than a line, but the row bookkeeping,
         // cursor and marker column are the same — that is the point of aligning bytes with
         // the same machinery as lines.
         let gutter = hex_gutter_width(view);
-        let hex_pane = |bytes: &[u8], side: SideIdx, area: Rect, frame: &mut Frame<'_>| {
-            frame.render_widget(
-                hex::HexPane {
-                    alignment,
-                    rows: &view.rows,
-                    bytes,
-                    side,
-                    top: view.top,
-                    cursor: view.cursor,
-                    h_scroll: view.h_scroll,
-                    gutter_width: gutter,
-                    per_row,
-                    theme,
-                    focused: view.focus == side,
-                },
-                area,
-            );
-        };
-        hex_pane(left_bytes, SideIdx::LEFT, left, frame);
-        hex_pane(right_bytes, SideIdx::RIGHT, right, frame);
+        for ((side, area), bytes) in panes.into_iter().zip([left_bytes, right_bytes]) {
+            let pane = hex::HexPane {
+                alignment,
+                rows: &view.rows,
+                bytes,
+                side,
+                top: view.top,
+                cursor: view.cursor,
+                h_scroll: view.h_scroll,
+                gutter_width: gutter,
+                per_row,
+                theme,
+                focused: view.focus == side,
+            };
+            place(root, area, pane.render(area.width, area.height));
+        }
     } else if let Some((left_text, right_text)) = text_sides {
-        let pane = |text: &TextFile, side: SideIdx, area: Rect, frame: &mut Frame<'_>| {
-            frame.render_widget(
-                DiffPane {
-                    alignment,
-                    rows: &view.rows,
-                    matches: view.search.as_ref().map_or(&[][..], |s| &s.matches),
-                    current_match: view.search.as_ref().and_then(|s| s.current_match()),
-                    text,
-                    side,
-                    top: view.top,
-                    cursor: view.cursor,
-                    h_scroll: view.h_scroll,
-                    gutter_width: gutter_width(text),
-                    tab_width,
-                    theme,
-                    focused: view.focus == side,
-                },
-                area,
-            );
-        };
-        pane(left_text, SideIdx::LEFT, left, frame);
-        pane(right_text, SideIdx::RIGHT, right, frame);
+        for ((side, area), text) in panes.into_iter().zip([left_text, right_text]) {
+            let pane = DiffPane {
+                alignment,
+                rows: &view.rows,
+                matches: view.search.as_ref().map_or(&[][..], |s| &s.matches),
+                current_match: view.search.as_ref().and_then(|s| s.current_match()),
+                text,
+                side,
+                top: view.top,
+                cursor: view.cursor,
+                h_scroll: view.h_scroll,
+                gutter_width: gutter_width(text),
+                tab_width,
+                theme,
+                focused: view.focus == side,
+            };
+            place(root, area, pane.render(area.width, area.height));
+        }
     }
 
-    draw_markers(frame, marker, view, theme);
+    place(root, marker, markers(marker, view, theme));
 }
 
 /// The column between the panes: the only place the diff is legible with colour off.
-fn draw_markers(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
+fn markers(area: Rect, view: &FileView, theme: &Theme) -> Canvas {
+    let mut canvas = Canvas::new(area.width, area.height);
     let Some(alignment) = view.cmp.alignment.as_ref() else {
-        return;
+        return canvas;
     };
-    let mut lines = Vec::with_capacity(area.height as usize);
-    for dy in 0..area.height {
-        let Some(view_row) = view.rows.get(view.top + dy as usize).copied() else {
+    for y in 0..area.height {
+        let index = view.top + y as usize;
+        let Some(view_row) = view.rows.get(index).copied() else {
             break;
         };
+        let on_cursor = index == view.cursor;
         // A fold covers only equal rows, so it never hides a marker.
         if view_row.is_fold() {
-            let style = if view.top + dy as usize == view.cursor {
+            let style = if on_cursor {
                 theme.cursor(theme.fold)
             } else {
                 theme.fold
             };
-            lines.push(Line::from(Span::styled("\u{22ef}  ".to_string(), style)));
+            canvas.print(0, y, "\u{22ef}  ", area.width, style);
             continue;
         }
         let Some(row) = alignment.row(view_row.anchor() as usize) else {
@@ -502,46 +567,40 @@ fn draw_markers(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Them
                 }
             }
         };
-        let style = if view.top + dy as usize == view.cursor {
+        let style = if on_cursor {
             theme.cursor(theme.marker)
         } else {
             theme.marker
         };
-        lines.push(Line::from(Span::styled(format!(" {glyph} "), style)));
+        canvas.print(0, y, &format!(" {glyph} "), area.width, style);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    canvas
 }
 
-fn draw_not_diffable(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
-    let mut lines = vec![Line::from("")];
+fn draw_not_diffable(root: &mut Root<'_>, area: Rect, view: &FileView, theme: &Theme) {
+    let plain = |text: String| vec![(text, Style::new())];
+    let mut lines = vec![plain(String::new())];
     if let Some(note) = &view.cmp.note {
-        lines.push(Line::from(Span::styled(note.clone(), theme.warning)));
-        lines.push(Line::from(""));
+        lines.push(vec![(note.clone(), theme.warning)]);
+        lines.push(plain(String::new()));
     }
     for (label, content) in [("left ", &view.cmp.left), ("right", &view.cmp.right)] {
-        lines.push(Line::from(format!(
+        lines.push(plain(format!(
             "{label}  {}  {}",
             content.path().display(),
             describe(content)
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        if view.cmp.differ {
-            "the two files differ"
-        } else {
-            "the two files are identical"
-        },
-        theme.status,
-    )));
+    lines.push(plain(String::new()));
+    let verdict = if view.cmp.differ {
+        "the two files differ"
+    } else {
+        "the two files are identical"
+    };
+    lines.push(vec![(verdict.to_string(), theme.status)]);
 
-    let block = Block::bordered().title(" not comparable line by line ");
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    panel(root, area, Some(" not comparable line by line "));
+    paragraph(root, area.inner(), &lines, TextWrap::Word);
 }
 
 fn describe(content: &FileContent) -> String {
@@ -554,7 +613,7 @@ fn describe(content: &FileContent) -> String {
 }
 
 fn draw_file_status(
-    frame: &mut Frame<'_>,
+    root: &mut Root<'_>,
     area: Rect,
     view: &FileView,
     theme: &Theme,
@@ -639,19 +698,10 @@ fn draw_file_status(
     parts.push("? help".to_string());
     parts.push("q quit".to_string());
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {}", parts.join(" \u{b7} ")),
-            theme.status,
-        ))),
-        area,
-    );
+    let text = format!(" {}", parts.join(" \u{b7} "));
+    line(root, area, &[(text.as_str(), theme.status)]);
 }
 
-/// A small centred panel announcing that the two sides match.
-///
-/// Shown on opening and cleared by the first keystroke: two identical files render as a
-/// screen of unremarkable text, which looks the same as a diff that has not loaded.
 /// Offset-gutter width for a hex comparison. Shared by the width fit and the renderer so
 /// the two cannot disagree about how much room the row has.
 fn hex_gutter_width(view: &FileView) -> u16 {
@@ -664,7 +714,11 @@ fn hex_gutter_width(view: &FileView) -> u16 {
     hex::gutter_width(bytes as u64)
 }
 
-fn draw_identical_notice(frame: &mut Frame<'_>, area: Rect, view: &FileView, theme: &Theme) {
+/// A small centred panel announcing that the two sides match.
+///
+/// Shown on opening and cleared by the first keystroke: two identical files render as a
+/// screen of unremarkable text, which looks the same as a diff that has not loaded.
+fn draw_identical_notice(root: &mut Root<'_>, area: Rect, view: &FileView, theme: &Theme) {
     // How big the thing that matched is — a line count for text, a size for bytes.
     let size = match (view.cmp.hex, view.cmp.texts()) {
         (Some(_), _) => {
@@ -678,30 +732,29 @@ fn draw_identical_notice(frame: &mut Frame<'_>, area: Rect, view: &FileView, the
         _ => String::new(),
     };
 
-    let mut lines = vec![Line::from(Span::styled(
-        "  \u{2713}  identical".to_string(),
-        theme.identical,
-    ))];
+    let mut lines = vec![vec![("  \u{2713}  identical".to_string(), theme.identical)]];
     // `--ignore-whitespace` and the CRLF case both reach this overlay, and there the
     // headline alone would overstate it.
     if let Some(note) = view.cmp.note.as_ref() {
-        lines.push(Line::from(Span::styled(
-            format!("     {note}"),
-            theme.warning,
-        )));
+        lines.push(vec![(format!("     {note}"), theme.warning)]);
     }
-    lines.push(Line::from(Span::styled(
+    lines.push(vec![(
         if size.is_empty() {
             "     press any key".to_string()
         } else {
             format!("     {size} \u{00b7} press any key")
         },
         theme.status,
-    )));
+    )]);
 
     let width = lines
         .iter()
-        .map(ratatui::text::Line::width)
+        .map(|parts| {
+            parts
+                .iter()
+                .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(20)
         .saturating_add(4)
@@ -714,11 +767,11 @@ fn draw_identical_notice(frame: &mut Frame<'_>, area: Rect, view: &FileView, the
         height,
     };
 
-    Clear.render(popup, frame.buffer_mut());
-    frame.render_widget(Paragraph::new(lines).block(Block::bordered()), popup);
+    panel(root, popup, None);
+    paragraph(root, popup.inner(), &lines, TextWrap::None);
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
+fn draw_help(root: &mut Root<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
     // Grouped rather than one key per line: the list has to fit a short terminal, and a
     // clipped help screen is worse than a terse one.
     const FILE_HELP: &[(&str, &str)] = &[
@@ -758,32 +811,67 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
         height,
     };
 
-    let lines: Vec<Line> = help
+    let lines: Vec<Vec<(String, Style)>> = help
         .iter()
         .map(|(keys, what)| {
-            Line::from(vec![
-                Span::styled(format!(" {keys:<24}"), theme.header_focus),
-                Span::styled((*what).to_string(), Style::new()),
-            ])
+            vec![
+                (format!(" {keys:<24}"), theme.header_focus),
+                ((*what).to_string(), Style::new()),
+            ]
         })
         .collect();
 
-    Clear.render(popup, frame.buffer_mut());
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" keys ")),
-        popup,
-    );
+    panel(root, popup, Some(" keys "));
+    paragraph(root, popup.inner(), &lines, TextWrap::None);
+}
+
+/// Header, body and status bar: a row each for the first and last, the rest between.
+fn screen_rows(area: Rect) -> [Rect; 3] {
+    let header = area.height.min(1);
+    let status = u16::from(area.height >= 2);
+    let body = area.height - header - status;
+    [
+        Rect {
+            height: header,
+            ..area
+        },
+        Rect {
+            y: area.y + header,
+            height: body,
+            ..area
+        },
+        Rect {
+            y: area.y + header + body,
+            height: status,
+            ..area
+        },
+    ]
 }
 
 /// Split an area into left pane, marker column, right pane.
+///
+/// The panes share what the marker leaves, and an odd column goes to the left one.
 fn pane_columns(area: Rect) -> [Rect; 3] {
-    let cols = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(MARKER_WIDTH),
-        Constraint::Fill(1),
-    ])
-    .split(area);
-    [cols[0], cols[1], cols[2]]
+    let marker = MARKER_WIDTH.min(area.width);
+    let panes = area.width - marker;
+    let left = panes.div_ceil(2);
+    let right = panes - left;
+    [
+        Rect {
+            width: left,
+            ..area
+        },
+        Rect {
+            x: area.x + left,
+            width: marker,
+            ..area
+        },
+        Rect {
+            x: area.x + left + marker,
+            width: right,
+            ..area
+        },
+    ]
 }
 
 /// Gutter wide enough for the largest line number, with a sensible floor.
@@ -808,23 +896,41 @@ mod tests {
 
     #[test]
     fn pane_columns_survive_a_tiny_terminal() {
-        // Two columns cannot hold two panes plus a 3-wide marker; the layout must still
-        // produce valid rects rather than panicking.
+        // Two columns cannot hold two panes plus a 3-wide marker; the split must still
+        // produce valid rects rather than underflowing.
         let [left, marker, right] = pane_columns(Rect::new(0, 0, 2, 1));
         assert!(left.width + marker.width + right.width <= 2);
+    }
+
+    #[test]
+    fn an_odd_column_goes_to_the_left_pane() {
+        let [left, marker, right] = pane_columns(Rect::new(0, 0, 30, 1));
+        assert_eq!(
+            (left.width, marker.x, right.x, right.width),
+            (14, 14, 17, 13)
+        );
+    }
+
+    #[test]
+    fn the_body_is_what_the_header_and_status_bar_leave() {
+        let [header, body, status] = screen_rows(Rect::new(0, 0, 10, 7));
+        assert_eq!((header.y, header.height), (0, 1));
+        assert_eq!((body.y, body.height), (1, 5));
+        assert_eq!((status.y, status.height), (6, 1));
+
+        // Too short for all three: nothing underflows, and the header survives longest.
+        let [header, body, status] = screen_rows(Rect::new(0, 0, 10, 1));
+        assert_eq!((header.height, body.height, status.height), (1, 0, 0));
     }
 }
 
 #[cfg(test)]
 mod render_tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
     use crate::app::{App, Options};
     use crate::diff::{DEFAULT_TIMEOUT, DiffOptions, compare_loaded};
     use crate::text::{FileContent, decode};
     use crate::theme::Theme;
-    use crate::{Inputs, app};
+    use crate::{Inputs, app, testing};
 
     fn content(name: &str, body: &str) -> FileContent {
         FileContent::Text(Box::new(decode(
@@ -862,18 +968,7 @@ mod render_tests {
     }
 
     fn frame(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| super::draw(f, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        testing::render(app, width, height).lines()
     }
 
     #[test]
@@ -921,7 +1016,7 @@ mod render_tests {
         let lines = frame(&mut app, 46, 12);
         let joined = lines.join("\n");
         assert!(joined.contains("not comparable line by line"), "{joined}");
-        assert!(joined.contains("right binary"), "{joined}");
+        assert!(joined.contains("right  b.bin  binary"), "{joined}");
         assert!(joined.contains("binary, 2.0 KiB"), "{joined}");
     }
 
@@ -935,15 +1030,12 @@ mod render_tests {
 
 #[cfg(test)]
 mod dir_render_tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
     use crate::app::{App, DirFilter, Options};
     use crate::diff::DiffOptions;
     use crate::dirdiff::{DirEntryRow, EntryKind, EntryStatus, ScanEvent};
     use crate::model::SideIdx;
     use crate::theme::Theme;
-    use crate::{Inputs, app};
+    use crate::{Inputs, app, testing};
 
     /// `present` is derived from the status, exactly as the scanner does it -- a fixture
     /// that claims both sides hold a one-sided entry would hide a real rendering bug.
@@ -1002,18 +1094,7 @@ mod dir_render_tests {
     }
 
     fn frame(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| super::draw(f, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        testing::render(app, width, height).lines()
     }
 
     fn sample() -> Vec<DirEntryRow> {
@@ -1166,12 +1247,10 @@ mod dir_render_tests {
 
 #[cfg(test)]
 mod cursor_tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
-
     use crate::app::{App, Options, View};
     use crate::diff::{DiffOptions, compare_loaded};
+    use crate::style::Color;
+    use crate::testing::{self, Screen};
     use crate::text::{FileContent, decode};
     use crate::theme::Theme;
     use crate::{Inputs, app};
@@ -1211,26 +1290,22 @@ mod cursor_tests {
         app
     }
 
-    fn render(app: &mut App, width: u16, height: u16) -> Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| super::draw(f, app)).unwrap();
-        terminal.backend().buffer().clone()
+    fn render(app: &mut App, width: u16, height: u16) -> Screen {
+        testing::render(app, width, height)
     }
 
-    fn row_backgrounds(buf: &Buffer, y: u16, width: u16) -> Vec<Option<ratatui::style::Color>> {
-        (0..width)
-            .map(|x| buf.cell((x, y)).unwrap().style().bg)
-            .collect()
+    fn row_backgrounds(screen: &Screen, y: u16, width: u16) -> Vec<Option<Color>> {
+        (0..width).map(|x| screen.bg(x, y)).collect()
     }
 
     #[test]
     fn the_selected_row_is_highlighted_across_the_full_width() {
         let mut app = file_app("one\ntwo\nthree\n", "one\ntwo\nthree\n");
-        let buf = render(&mut app, 40, 6);
+        let screen = render(&mut app, 40, 6);
 
         // Body starts at y=1. The cursor sits on the first row.
-        let selected = row_backgrounds(&buf, 1, 40);
-        let plain = row_backgrounds(&buf, 2, 40);
+        let selected = row_backgrounds(&screen, 1, 40);
+        let plain = row_backgrounds(&screen, 2, 40);
 
         assert!(
             selected.iter().all(|bg| *bg == selected[0]),
@@ -1247,8 +1322,8 @@ mod cursor_tests {
     #[test]
     fn the_highlight_covers_both_panes_and_the_marker_column() {
         let mut app = file_app("one\ntwo\n", "one\ntwo\n");
-        let buf = render(&mut app, 40, 5);
-        let selected = row_backgrounds(&buf, 1, 40);
+        let screen = render(&mut app, 40, 5);
+        let selected = row_backgrounds(&screen, 1, 40);
 
         // Left pane, marker column and right pane all carry it -- the cursor is a property
         // of the row, not of whichever pane happens to have focus.
@@ -1263,18 +1338,18 @@ mod cursor_tests {
     fn moving_the_cursor_moves_the_highlight() {
         let mut app = file_app("one\ntwo\nthree\n", "one\ntwo\nthree\n");
         let before = render(&mut app, 40, 6);
-        let first_row_bg = before.cell((2, 1)).unwrap().style().bg;
+        let first_row_bg = before.bg(2, 1);
 
         app.active_file().unwrap().cursor = 1;
         let after = render(&mut app, 40, 6);
 
         assert_ne!(
-            after.cell((2, 1)).unwrap().style().bg,
+            after.bg(2, 1),
             first_row_bg,
             "row 1 should no longer be highlighted"
         );
         assert_eq!(
-            after.cell((2, 2)).unwrap().style().bg,
+            after.bg(2, 2),
             first_row_bg,
             "row 2 should now carry the highlight"
         );
@@ -1285,12 +1360,12 @@ mod cursor_tests {
         // The reason the cursor lifts the background instead of reversing it: a selected
         // changed line must still look changed.
         let mut app = file_app("same\nold\n", "same\nnew\n");
-        let mut buf = render(&mut app, 40, 5);
-        let equal_selected = buf.cell((2, 1)).unwrap().style().bg;
+        let mut screen = render(&mut app, 40, 5);
+        let equal_selected = screen.bg(2, 1);
 
         app.active_file().unwrap().cursor = 1;
-        buf = render(&mut app, 40, 5);
-        let changed_selected = buf.cell((2, 2)).unwrap().style().bg;
+        screen = render(&mut app, 40, 5);
+        let changed_selected = screen.bg(2, 2);
 
         assert_ne!(
             equal_selected, changed_selected,
@@ -1301,12 +1376,9 @@ mod cursor_tests {
 
 #[cfg(test)]
 mod hex_render_tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
-
     use crate::app::{App, Options, View};
     use crate::diff::{DiffOptions, compare_loaded};
+    use crate::testing::{self, Screen};
     use crate::text::{BinaryReason, FileContent};
     use crate::theme::Theme;
     use crate::{Inputs, app};
@@ -1352,20 +1424,9 @@ mod hex_render_tests {
         app
     }
 
-    fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Buffer) {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| super::draw(f, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let lines = (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect();
-        (lines, buffer)
+    fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Screen) {
+        let screen = testing::render(app, width, height);
+        (screen.lines(), screen)
     }
 
     #[test]
@@ -1390,7 +1451,7 @@ mod hex_render_tests {
     fn only_the_differing_bytes_are_emphasised() {
         // Byte 1 of the second row differs; byte 0 does not.
         let mut app = hex_app(b"abcdXY", b"abcdXZ", 4);
-        let (lines, buf) = render(&mut app, 66, 5);
+        let (lines, screen) = render(&mut app, 66, 5);
         assert_eq!(
             lines[2],
             "0004 58 59        |XY  |         \u{25ac} 0004 58 5a        |XZ  |"
@@ -1398,7 +1459,7 @@ mod hex_render_tests {
 
         // The left pane starts at column 0; gutter is 4 wide plus a space, so the hex
         // area begins at column 5. Byte 0 is columns 5..7, byte 1 is 8..10.
-        let bg = |x: u16| buf.cell((x, 2)).unwrap().style().bg;
+        let bg = |x: u16| screen.bg(x, 2);
         let row_bg = bg(5);
         assert_eq!(bg(6), row_bg, "byte 0 matches, so it keeps the row colour");
         assert_ne!(bg(8), row_bg, "byte 1 differs and must stand out");
@@ -1408,10 +1469,10 @@ mod hex_render_tests {
     #[test]
     fn the_ascii_column_is_emphasised_too() {
         let mut app = hex_app(b"abcdXY", b"abcdXZ", 4);
-        let (lines, buf) = render(&mut app, 66, 5);
+        let (lines, screen) = render(&mut app, 66, 5);
         // Find the 'Y' in the left pane's ascii block on row 2.
         let y_col = lines[2].find('Y').unwrap() as u16;
-        let bg = |x: u16| buf.cell((x, 2)).unwrap().style().bg;
+        let bg = |x: u16| screen.bg(x, 2);
         assert_ne!(
             bg(y_col),
             bg(y_col - 1),
@@ -1484,12 +1545,10 @@ mod hex_render_tests {
 
 #[cfg(test)]
 mod notice_tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
     use crate::app::{App, Options, View};
     use crate::diff::{DiffOptions, Whitespace, compare_loaded};
+    use crate::key::{KeyCode, KeyEvent};
+    use crate::testing;
     use crate::text::{BinaryReason, FileContent, decode};
     use crate::theme::Theme;
     use crate::{Inputs, app};
@@ -1546,17 +1605,7 @@ mod notice_tests {
     }
 
     fn screen(app: &mut App, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| super::draw(f, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        testing::render(app, width, height).text()
     }
 
     #[test]
@@ -1576,16 +1625,14 @@ mod notice_tests {
     #[test]
     fn the_notice_is_green() {
         let mut app = app_for(text("a\n"), text("a\n"), Whitespace::Exact);
-        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
-        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let rendered = testing::render(&mut app, 50, 12);
 
-        let tick = (0..50u16)
+        let (x, y) = (0..50u16)
             .flat_map(|x| (0..12u16).map(move |y| (x, y)))
-            .find(|&(x, y)| buffer.cell((x, y)).unwrap().symbol() == "\u{2713}")
+            .find(|&(x, y)| rendered.cell(x, y).symbol == "\u{2713}")
             .expect("the tick should be on screen");
         assert_eq!(
-            buffer.cell(tick).unwrap().style().fg,
+            rendered.fg(x, y),
             Theme::dark().identical.fg,
             "the good news should be green"
         );
@@ -1628,7 +1675,7 @@ mod notice_tests {
         assert!(app.active_file().unwrap().notice);
 
         // 'j' dismisses the notice *and* moves the cursor: it is informational, not modal.
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j')));
         assert!(!app.active_file().unwrap().notice);
         assert_eq!(app.active_file().unwrap().cursor, 1);
 
@@ -1641,7 +1688,7 @@ mod notice_tests {
         // Opening an identical file from the directory view and pressing Esc should go
         // straight back, not eat the keystroke on the overlay.
         let mut app = app_for(text("a\n"), text("a\n"), Whitespace::Exact);
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc));
         assert!(app.should_quit, "Esc on the only view should still quit");
     }
 

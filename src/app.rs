@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::DefaultTerminal;
-use ratatui::layout::Rect;
+use blit::{Frame, Input};
+use blit_tui::{Session, Ui};
 
 use crate::diff::{DiffOptions, FileComparison};
 use crate::dirdiff::{DirEntryRow, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan};
 use crate::edit::{self, Edit};
+use crate::key::{KeyCode, KeyEvent};
 use crate::model::{self, SideIdx, ViewRow};
 use crate::pane::MAX_H_SCROLL;
 use crate::search::{self, Match};
@@ -258,8 +258,8 @@ impl FileView {
     ///
     /// Called at the top of every draw rather than from a resize handler, so it also
     /// covers the first frame and any freshly pushed view.
-    pub fn clamp(&mut self, viewport: Rect) {
-        self.viewport = viewport.height.max(1);
+    pub fn clamp(&mut self, height: u16) {
+        self.viewport = height.max(1);
         let rows = self.row_count();
         let height = self.viewport as usize;
 
@@ -496,8 +496,8 @@ impl DirView {
         self.rows.get(i)
     }
 
-    pub fn clamp(&mut self, viewport: Rect) {
-        self.viewport = viewport.height.max(1);
+    pub fn clamp(&mut self, height: u16) {
+        self.viewport = height.max(1);
         let count = self.visible().len();
         let height = self.viewport as usize;
 
@@ -802,7 +802,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.ctrl;
 
         // The identical overlay is informational, not modal: the first keystroke clears it
         // *and* does what it normally would, so Esc still goes straight back.
@@ -1034,23 +1034,55 @@ fn report(result: Result<(), &'static str>) -> String {
     }
 }
 
+/// How long to wait for a key before looking at background work again.
+const TICK: Duration = Duration::from_millis(100);
+
 /// The event loop.
 ///
 /// Redraws every iteration and blocks in `poll` otherwise, so an idle yadt costs nothing —
-/// while a running directory scan still lands within one poll interval.
-pub fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+/// while a running directory scan still lands within one poll interval. blit writes only
+/// the cells that changed, so an idle redraw sends nothing to the terminal.
+///
+/// The session restores the terminal when it is dropped, which covers an early `?` return
+/// and a panic unwinding through here as well as the normal way out.
+pub fn run_app(app: &mut App) -> Result<()> {
+    let mut session = Session::new()?;
+    release_mouse()?;
+    let mut frame = Frame::default();
+    let mut inputs = [Input::None; 32];
+
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        let info = session.frame_info();
+        frame.render(session.platform_mut(), info, |builder: Ui<'_>| {
+            ui::draw(builder, app);
+        });
+        session.present()?;
         app.tick();
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key(key);
+        let poll = session.poll(Some(TICK), &mut inputs)?;
+        if poll.resized {
+            // Every cell on screen is stale, not just the ones the next frame changes.
+            session.platform_mut().renderer_mut().invalidate();
+        }
+        for &input in &inputs[..poll.input_count] {
+            if let Some(key) = KeyEvent::from_input(input) {
+                app.handle_key(key);
+            }
         }
     }
+    session.finish()?;
     Ok(())
+}
+
+/// blit switches mouse reporting on when it takes the terminal. yadt switches it straight
+/// back off: while it is on, the terminal's own text selection stops working, and selecting
+/// a line of a diff to copy is a common thing to want.
+fn release_mouse() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    tty.write_all(b"\x1b[?1003l\x1b[?1006l")?;
+    tty.flush()
 }
 
 #[cfg(test)]
@@ -1430,7 +1462,6 @@ mod search_view_tests {
     use super::*;
     use crate::diff::{DiffOptions, compare_loaded};
     use crate::text::{FileContent, decode};
-    use crossterm::event::KeyModifiers;
 
     fn content(body: &str) -> FileContent {
         FileContent::Text(Box::new(decode(
@@ -1448,11 +1479,11 @@ mod search_view_tests {
     }
 
     fn press(app: &mut App, c: char) {
-        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(c)));
     }
 
     fn key(app: &mut App, code: KeyCode) {
-        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(code));
     }
 
     fn app_with(view: FileView) -> App {
@@ -1648,7 +1679,6 @@ mod hex_view_tests {
     use super::*;
     use crate::diff::{DiffOptions, compare_loaded};
     use crate::text::{BinaryReason, FileContent};
-    use crossterm::event::KeyModifiers;
 
     fn binary(bytes: &[u8]) -> FileContent {
         FileContent::Binary {
@@ -1736,7 +1766,7 @@ mod hex_view_tests {
     #[test]
     fn search_is_refused_in_the_hex_view_rather_than_silently_failing() {
         let mut app = app_with(hex_view(b"abcd", b"abcX"));
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/')));
         assert!(app.prompt.is_none(), "no prompt should open");
         assert!(
             app.status.contains("not available"),
@@ -2097,7 +2127,6 @@ impl FileView {
 mod edit_view_tests {
     use super::*;
     use crate::diff::{DiffOptions, compare_files};
-    use crossterm::event::KeyModifiers;
 
     struct Scratch(PathBuf);
 
@@ -2355,7 +2384,7 @@ mod edit_view_tests {
             exit_code: 0,
         };
         let press = |app: &mut App, c: char| {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Char(c)));
         };
 
         app.active_file().unwrap().cursor = 1;
@@ -2374,7 +2403,7 @@ mod edit_view_tests {
         // 'u' alone undoes; Ctrl-u must still page.
         app.active_file().unwrap().cursor = 1;
         press(&mut app, '>');
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::ctrl(KeyCode::Char('u')));
         assert!(
             app.active_file().unwrap().is_dirty(),
             "Ctrl-u should page, not undo"
@@ -2415,7 +2444,6 @@ mod quit_guard_tests {
     use super::*;
     use crate::diff::{DiffOptions, compare_loaded};
     use crate::text::{FileContent, decode};
-    use crossterm::event::KeyModifiers;
 
     fn text(body: &str) -> FileContent {
         FileContent::Text(Box::new(decode(
@@ -2448,7 +2476,7 @@ mod quit_guard_tests {
     }
 
     fn press(app: &mut App, c: char) {
-        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(c)));
     }
 
     fn dirty_app() -> App {
@@ -2485,9 +2513,9 @@ mod quit_guard_tests {
     #[test]
     fn escape_out_of_a_dirty_view_asks_too() {
         let mut app = dirty_app();
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc));
         assert!(!app.should_quit);
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc));
         assert!(app.should_quit);
     }
 

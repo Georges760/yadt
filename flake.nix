@@ -38,8 +38,12 @@
           inherit src;
 
           # Vendored straight from the checked-in lock file, so there is no
-          # cargoHash to bump when a dependency changes.
-          cargoLock.lockFile = ./Cargo.lock;
+          # cargoHash to bump when a dependency changes. The exception is blit,
+          # which comes from git: its hash has to move with the rev in Cargo.toml.
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes."blit-0.1.0" = "sha256-GVpiT29S3wZ2o7lbYlqRlz/O0xErml3sZrBYm2pgaEI=";
+          };
 
           meta = {
             description = "Terminal diff tool for two files or two directory trees";
