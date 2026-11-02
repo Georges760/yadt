@@ -60,6 +60,9 @@ Each side shows its own tree, with a blank where a name is missing on that side,
 reading down one column tells you what that tree contains. `≠` is a name that is a
 directory on one side and a file on the other; `↻` is a symlink cycle.
 
+A directory opens by itself once a difference is found inside it; an identical one stays
+folded. A directory you fold or unfold by hand stays that way, including across a rescan.
+
 ## Keys
 
 **File view**

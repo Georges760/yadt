@@ -352,6 +352,9 @@ pub struct DirView {
     /// Where each entry lives in `rows`, so a roll-up `Update` can find its directory.
     index: HashMap<PathBuf, usize>,
     collapsed: HashSet<PathBuf>,
+    /// Directories the user has folded or unfolded by hand. The scan's default never
+    /// overrides these, and they outlive a rescan.
+    fold_chosen: HashSet<PathBuf>,
     pub filter: DirFilter,
     /// Index into `visible`, not into `rows`.
     pub cursor: usize,
@@ -373,6 +376,7 @@ impl DirView {
             rows: Vec::new(),
             index: HashMap::new(),
             collapsed: HashSet::new(),
+            fold_chosen: HashSet::new(),
             filter: DirFilter::All,
             cursor: 0,
             top: 0,
@@ -428,8 +432,14 @@ impl DirView {
         match event {
             ScanEvent::Entry(row) => {
                 self.index.insert(row.rel.clone(), self.rows.len());
+                // Every directory starts folded and is opened by the first difference
+                // found inside it, so an identical one never flashes open.
+                if row.status == EntryStatus::Pending && !self.fold_chosen.contains(&row.rel) {
+                    self.collapsed.insert(row.rel.clone());
+                }
                 if row.status.differs() {
                     self.differing += 1;
+                    self.reveal(&row.rel);
                 }
                 self.rows.push(*row);
                 self.scanned += 1;
@@ -446,6 +456,9 @@ impl DirView {
                         }
                     }
                     self.rows[i].status = status;
+                    if status.differs() {
+                        self.reveal(&rel);
+                    }
                     self.dirty = true;
                 }
             }
@@ -454,6 +467,19 @@ impl DirView {
             ScanEvent::Done { .. } => {
                 self.done = true;
                 self.dirty = true;
+            }
+        }
+    }
+
+    /// Open `rel` and every directory above it, because a difference was found there.
+    ///
+    /// This cannot move the cursor. The walk is depth-first and those directories are all
+    /// still being walked, so what they hide is the tail of `rows`: newly shown entries land
+    /// after everything already visible.
+    fn reveal(&mut self, rel: &Path) {
+        for dir in rel.ancestors() {
+            if !self.fold_chosen.contains(dir) {
+                self.collapsed.remove(dir);
             }
         }
     }
@@ -546,6 +572,7 @@ impl DirView {
             return;
         }
         let rel = row.rel.clone();
+        self.fold_chosen.insert(rel.clone());
         if !self.collapsed.remove(&rel) {
             self.collapsed.insert(rel);
         }
@@ -557,11 +584,13 @@ impl DirView {
             return;
         };
         let (rel, is_dir) = (row.rel.clone(), row.kind.is_dir());
-        if is_dir && collapsed {
-            self.collapsed.insert(rel);
-            self.dirty = true;
-        } else if is_dir && !collapsed {
-            self.collapsed.remove(&rel);
+        if is_dir {
+            self.fold_chosen.insert(rel.clone());
+            if collapsed {
+                self.collapsed.insert(rel);
+            } else {
+                self.collapsed.remove(&rel);
+            }
             self.dirty = true;
         } else if collapsed {
             // On a file, collapse jumps to the parent directory instead.
@@ -1111,6 +1140,7 @@ mod tests {
             rows: Vec::new(),
             index: HashMap::new(),
             collapsed: HashSet::new(),
+            fold_chosen: HashSet::new(),
             filter: DirFilter::All,
             cursor: 0,
             top: 0,
@@ -1259,6 +1289,160 @@ mod tests {
         v.toggle_expand();
         assert!(v.selected().is_none());
         assert!(names(&mut v).is_empty());
+    }
+
+    fn entry(v: &mut DirView, rel: &str, kind: EntryKind, status: EntryStatus) {
+        let depth = Path::new(rel).components().count() as u16 - 1;
+        v.apply(ScanEvent::Entry(Box::new(row(rel, depth, kind, status))));
+    }
+
+    fn roll_up(v: &mut DirView, rel: &str, status: EntryStatus) {
+        v.apply(ScanEvent::Update {
+            rel: PathBuf::from(rel),
+            status,
+        });
+    }
+
+    #[test]
+    fn only_directories_with_differences_inside_start_expanded() {
+        let mut v = view(vec![]);
+        entry(&mut v, "loud", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "loud/calm", EntryKind::Dir, EntryStatus::Pending);
+        entry(
+            &mut v,
+            "loud/calm/a",
+            EntryKind::File,
+            EntryStatus::Identical,
+        );
+        roll_up(&mut v, "loud/calm", EntryStatus::Identical);
+        entry(&mut v, "loud/deep", EntryKind::Dir, EntryStatus::Pending);
+        entry(
+            &mut v,
+            "loud/deep/b",
+            EntryKind::File,
+            EntryStatus::Differing,
+        );
+        roll_up(&mut v, "loud/deep", EntryStatus::Differing);
+        roll_up(&mut v, "loud", EntryStatus::Differing);
+        entry(&mut v, "quiet", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "quiet/c", EntryKind::File, EntryStatus::Identical);
+        roll_up(&mut v, "quiet", EntryStatus::Identical);
+
+        assert_eq!(
+            names(&mut v),
+            ["loud", "loud/calm", "loud/deep", "loud/deep/b", "quiet"]
+        );
+    }
+
+    #[test]
+    fn a_directory_opens_as_soon_as_a_difference_is_found_inside_it() {
+        let mut v = view(vec![]);
+        entry(&mut v, "top", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "top/mid", EntryKind::Dir, EntryStatus::Pending);
+        assert_eq!(names(&mut v), ["top"], "nothing to show yet");
+
+        entry(
+            &mut v,
+            "top/mid/gone",
+            EntryKind::File,
+            EntryStatus::OnlyIn(SideIdx::LEFT),
+        );
+        assert_eq!(names(&mut v), ["top", "top/mid", "top/mid/gone"]);
+    }
+
+    #[test]
+    fn a_directory_that_differs_with_no_differing_entry_still_opens() {
+        // Nothing inside says so, only the roll-up: the event stream alone must be enough.
+        let mut v = view(vec![]);
+        entry(&mut v, "top", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "top/shut", EntryKind::Dir, EntryStatus::Pending);
+        roll_up(&mut v, "top/shut", EntryStatus::Differing);
+        assert!(!v.is_collapsed(Path::new("top")));
+        assert!(!v.is_collapsed(Path::new("top/shut")));
+    }
+
+    #[test]
+    fn opening_a_directory_during_the_scan_does_not_move_the_cursor() {
+        let mut v = view(vec![]);
+        entry(&mut v, "a", EntryKind::File, EntryStatus::Identical);
+        entry(&mut v, "calm", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "calm/x", EntryKind::File, EntryStatus::Identical);
+        roll_up(&mut v, "calm", EntryStatus::Identical);
+        entry(&mut v, "sub", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "sub/y", EntryKind::File, EntryStatus::Identical);
+        v.cursor = 2;
+        assert_eq!(v.selected().unwrap().rel, PathBuf::from("sub"));
+
+        entry(&mut v, "sub/z", EntryKind::File, EntryStatus::Differing);
+
+        assert_eq!(v.selected().unwrap().rel, PathBuf::from("sub"));
+        assert_eq!(names(&mut v), ["a", "calm", "sub", "sub/y", "sub/z"]);
+    }
+
+    #[test]
+    fn the_scan_does_not_override_a_fold_the_user_chose() {
+        let mut v = view(vec![]);
+        entry(&mut v, "shut", EntryKind::Dir, EntryStatus::Pending);
+        v.toggle_expand(); // open it by hand...
+        v.toggle_expand(); // ...and close it again, so the choice is "folded"
+        entry(&mut v, "shut/b", EntryKind::File, EntryStatus::Differing);
+        roll_up(&mut v, "shut", EntryStatus::Differing);
+        assert!(v.is_collapsed(Path::new("shut")));
+
+        entry(&mut v, "open", EntryKind::Dir, EntryStatus::Pending);
+        v.cursor = 1;
+        v.set_collapsed(false);
+        entry(&mut v, "open/a", EntryKind::File, EntryStatus::Identical);
+        roll_up(&mut v, "open", EntryStatus::Identical);
+        assert!(!v.is_collapsed(Path::new("open")));
+    }
+
+    #[test]
+    fn a_fold_the_user_chose_survives_a_rescan_and_the_default_does_not() {
+        let mut v = view(vec![]);
+        entry(&mut v, "chosen", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "was_calm", EntryKind::Dir, EntryStatus::Pending);
+        v.set_collapsed(false); // chosen: open
+        roll_up(&mut v, "chosen", EntryStatus::Identical);
+        roll_up(&mut v, "was_calm", EntryStatus::Identical);
+
+        v.rescan(false);
+        v.scan = None;
+
+        entry(&mut v, "chosen", EntryKind::Dir, EntryStatus::Pending);
+        assert!(!v.is_collapsed(Path::new("chosen")));
+        entry(&mut v, "was_calm", EntryKind::Dir, EntryStatus::Pending);
+        assert!(v.is_collapsed(Path::new("was_calm")));
+        entry(
+            &mut v,
+            "was_calm/new",
+            EntryKind::File,
+            EntryStatus::Differing,
+        );
+        assert!(!v.is_collapsed(Path::new("was_calm")));
+    }
+
+    #[test]
+    fn a_real_scan_folds_identical_directories_and_opens_differing_ones() {
+        let base = std::env::temp_dir().join(format!("yadt-fold-{}", std::process::id()));
+        let (left, right) = (base.join("l"), base.join("r"));
+        for root in [&left, &right] {
+            std::fs::create_dir_all(root.join("same/inner")).unwrap();
+            std::fs::create_dir_all(root.join("changed/inner")).unwrap();
+            std::fs::write(root.join("same/inner/a"), "a").unwrap();
+        }
+        std::fs::write(left.join("changed/inner/b"), "left").unwrap();
+        std::fs::write(right.join("changed/inner/b"), "right").unwrap();
+
+        let mut v = DirView::new(left, right, false);
+        v.wait_for_scan();
+        let shown = names(&mut v);
+        std::fs::remove_dir_all(&base).unwrap();
+
+        assert_eq!(
+            shown,
+            ["changed", "changed/inner", "changed/inner/b", "same"]
+        );
     }
 
     #[test]
