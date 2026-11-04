@@ -9,8 +9,8 @@
 //!
 //! This is also the one module that turns a [`Style`] into a blit cell style.
 
-use blit::{Atom, Constraints, Rect, Size};
-use blit_tui::TuiPlatform;
+use blit::{Atom, AtomCx, Constraints, PhysicalRect, Size};
+use blit_tui::Context;
 use blit_tui::cell::{Cell, CellStyle};
 use blit_tui::color::Color as TermColor;
 use blit_tui::text::{Span, TextAttributes};
@@ -128,13 +128,13 @@ impl Canvas {
     }
 }
 
-impl Atom<TuiPlatform> for Canvas {
-    fn measure(&self, _: &mut TuiPlatform, constraints: Constraints) -> Size {
-        constraints.constrain(Size::new(f32::from(self.width), f32::from(self.height)))
+impl<C: Context> Atom<C> for Canvas {
+    fn measure(&self, _: &mut AtomCx<'_, C>, constraints: Constraints<i32>) -> Size<i32> {
+        constraints.constrain(Size::new(i32::from(self.width), i32::from(self.height)))
     }
 
-    fn paint(&self, platform: &mut TuiPlatform, area: Rect) {
-        let mut cells = platform.cells(area);
+    fn paint(&self, cx: &mut AtomCx<'_, C>, area: PhysicalRect) {
+        let mut cells = cx.context_mut().as_mut().cells(area);
         for op in &self.ops {
             match *op {
                 Op::Fill { x, y, width, style } => {
@@ -164,10 +164,6 @@ impl Atom<TuiPlatform> for Canvas {
                 }
             }
         }
-    }
-
-    fn paint_bounds(&self, area: Rect) -> Rect {
-        area
     }
 }
 
@@ -254,6 +250,7 @@ impl Canvas {
 
 #[cfg(test)]
 mod tests {
+    use blit::PhysicalRect;
     use blit_tui::layout::rect;
 
     use super::*;
@@ -293,8 +290,9 @@ mod tests {
         canvas.put(3, 0, "x", band.fg(Color::YELLOW));
 
         let screen = testing::paint(6, 1, |ui| {
-            ui.layout(rect::layout())
-                .child(Rect::new(0.0, 0.0, 6.0, 1.0))
+            ui.layout(rect::new())
+                .child()
+                .item(PhysicalRect::new(0, 0, 6, 1))
                 .insert(canvas);
         });
 

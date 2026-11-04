@@ -8,8 +8,8 @@ license = "MIT"
 anyhow = "1.0.104"
 # blit is not published, so it is pinned to a commit. Both crates come from the same
 # workspace and must move together.
-blit = { git = "https://github.com/nicoburniske/blit", rev = "1235e1775bae56686f3d0170b1dfab3ffff7f0cc" }
-blit-tui = { git = "https://github.com/nicoburniske/blit", rev = "1235e1775bae56686f3d0170b1dfab3ffff7f0cc" }
+blit = { git = "https://github.com/nicoburniske/blit", rev = "d607d7ec8f7cd2fe2785a7837a32f7495844d34c" }
+blit-tui = { git = "https://github.com/nicoburniske/blit", rev = "d607d7ec8f7cd2fe2785a7837a32f7495844d34c" }
 clap = { version = "4.6", features = ["derive"] }
 # Only for reading the terminal size before blit takes the terminal over.
 rustix = { version = "1", features = ["termios"] }

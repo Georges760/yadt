@@ -44,7 +44,7 @@ impl KeyEvent {
     /// Releases are dropped and repeats kept, so holding `j` scrolls. blit reports a plain
     /// character as `Text` and a modified one as a `Key`; both arrive here as `Char`, with
     /// Control recorded and any other modifier ignored.
-    pub fn from_input(input: Input) -> Option<Self> {
+    pub fn from_input(input: Input<i32>) -> Option<Self> {
         let (key, modifiers) = match input {
             Input::Text(c) => return Some(Self::new(KeyCode::Char(c))),
             Input::Key(KeyInput {
@@ -84,7 +84,7 @@ mod tests {
 
     use super::*;
 
-    fn key(key: Key, modifiers: Modifiers, pressed: bool, repeat: bool) -> Input {
+    fn key(key: Key, modifiers: Modifiers, pressed: bool, repeat: bool) -> Input<i32> {
         Input::Key(KeyInput {
             key,
             modifiers,

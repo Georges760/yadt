@@ -4,8 +4,10 @@
 //! write to the terminal are read back into a grid. Tests assert on that grid rather than on
 //! blit's cell buffer, which is private — and so they see what a terminal would show.
 
-use blit::{Frame, FrameInfo, LayoutResolution, Size};
-use blit_tui::{RendererConfig, TuiPlatform, TuiRenderer, Ui};
+use std::time::Duration;
+
+use blit::Frame;
+use blit_tui::{RendererConfig, TuiContext, TuiRenderer, Ui};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -37,15 +39,10 @@ pub struct Screen {
 /// Render one frame of `build` on a `width` × `height` terminal.
 pub fn paint(width: u16, height: u16, build: impl FnOnce(Ui<'_>)) -> Screen {
     let config = RendererConfig::new().columns(width).rows(height);
-    let mut platform = TuiPlatform::new(TuiRenderer::new(config));
-    let info = FrameInfo::new(Size::new(f32::from(width), f32::from(height))).layout_resolution(
-        LayoutResolution::Discrete {
-            step: Size::uniform(1.0),
-        },
-    );
-    Frame::default().render(&mut platform, info, build);
+    let mut context = TuiContext::new(TuiRenderer::new(config));
+    crate::ui::render_frame(&mut Frame::default(), &mut context, Duration::ZERO, build);
     // A fresh renderer writes every cell, so the output describes the whole screen.
-    Screen::parse(width.max(1), height.max(1), platform.renderer().output())
+    Screen::parse(width.max(1), height.max(1), context.renderer().output())
 }
 
 /// The app's frame, as `ui::draw` builds it.

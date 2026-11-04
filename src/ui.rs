@@ -9,13 +9,15 @@
 //! Anything that carries a background across a pane is painted cell by cell through a
 //! [`Canvas`]. One-line chrome, panels and the help overlay are blit's `Text` and `Block`.
 
-use blit::state;
-use blit_tui::Ui;
+use std::time::Duration;
+
+use blit::{Frame, FrameInfo, Input, state};
 use blit_tui::atom::Border;
 use blit_tui::color::Color as TermColor;
 use blit_tui::layout::rect;
 use blit_tui::text::{Span, TextOptions, TextWrap};
 use blit_tui::widget::{Block, Text, Title};
+use blit_tui::{TuiContext, Ui};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -66,15 +68,31 @@ impl Rect {
     }
 }
 
-impl From<Rect> for blit::Rect {
+impl From<Rect> for blit::PhysicalRect {
     fn from(area: Rect) -> Self {
         Self::new(
-            f32::from(area.x),
-            f32::from(area.y),
-            f32::from(area.width),
-            f32::from(area.height),
+            i32::from(area.x),
+            i32::from(area.y),
+            i32::from(area.width),
+            i32::from(area.height),
         )
     }
+}
+
+/// One frame through blit's three passes: build the tree, lay it out, paint it into the
+/// renderer, whose output then holds what the terminal needs to be sent.
+pub fn render_frame(
+    frame: &mut Frame<TuiContext>,
+    context: &mut TuiContext,
+    now: Duration,
+    build: impl FnOnce(Ui<'_>),
+) {
+    let info = FrameInfo::new(context.renderer().screen().size());
+    frame.build(context, info, now, Input::None, build);
+    frame.layout(context);
+    context.begin_paint();
+    frame.paint(context);
+    context.finish_paint();
 }
 
 /// Takes `&mut App` because scroll clamping happens here — doing it anywhere else leaves
@@ -86,7 +104,7 @@ pub fn draw(ui: Ui<'_>, app: &mut App) {
     let theme = app.theme;
     let tab_width = app.opts.tab_width;
     let message = app.status.clone();
-    let mut root = ui.layout(rect::layout());
+    let mut root = ui.layout(rect::new());
 
     match app.views.last_mut() {
         Some(View::File(view)) => {
@@ -139,9 +157,9 @@ pub fn draw(ui: Ui<'_>, app: &mut App) {
     }
 }
 
-/// A frame extent in whole cells. blit measures in `f32`; a terminal does not.
-fn cells(extent: f32) -> u16 {
-    extent.clamp(0.0, f32::from(u16::MAX)) as u16
+/// A frame extent in whole cells, in the `u16` the rest of the layout works in.
+fn cells(extent: i32) -> u16 {
+    u16::try_from(extent.max(0)).unwrap_or(u16::MAX)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -150,7 +168,7 @@ fn cells(extent: f32) -> u16 {
 
 /// Put a canvas on screen at `area`.
 fn place(root: &mut Root<'_>, area: Rect, canvas: Canvas) {
-    root.child(area.into()).insert(canvas);
+    root.child().item(area.into()).insert(canvas);
 }
 
 /// One line of styled parts along the top of `area`, clipped to its width.
@@ -159,7 +177,7 @@ fn line(root: &mut Root<'_>, area: Rect, parts: &[(&str, Style)]) {
         .iter()
         .map(|&(text, style)| canvas::span(text, style))
         .collect();
-    root.child(area.into()).insert(Text::rich(&spans));
+    root.child().item(area.into()).insert(Text::rich(&spans));
 }
 
 /// Lines of styled parts, filling `area` from the top.
@@ -171,7 +189,8 @@ fn paragraph(root: &mut Root<'_>, area: Rect, lines: &[Vec<(String, Style)>], wr
         }
         spans.extend(parts.iter().map(|(text, style)| canvas::span(text, *style)));
     }
-    root.child(area.into())
+    root.child()
+        .item(area.into())
         .insert(Text::rich(&spans).options(TextOptions::new().wrap(wrap)));
 }
 
@@ -183,7 +202,7 @@ fn panel(root: &mut Root<'_>, area: Rect, title: Option<&str>) {
     if let Some(title) = title {
         block = block.title(Title::new(title));
     }
-    root.child(area.into()).insert(block);
+    root.child().item(area.into()).insert(block);
 }
 
 // ---------------------------------------------------------------------------------------

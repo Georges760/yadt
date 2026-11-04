@@ -42,7 +42,7 @@
           # which comes from git: its hash has to move with the rev in Cargo.toml.
           cargoLock = {
             lockFile = ./Cargo.lock;
-            outputHashes."blit-0.1.0" = "sha256-GVpiT29S3wZ2o7lbYlqRlz/O0xErml3sZrBYm2pgaEI=";
+            outputHashes."blit-0.1.0" = "sha256-1bnq01aEEjvTnQNc9F7IZ9A/mmMs7nkMOT1f3UFkp2g=";
           };
 
           meta = {

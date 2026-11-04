@@ -6,11 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use blit::{Frame, Input};
-use blit_tui::{Session, Ui};
+use blit_tui::{RendererConfig, Session, TuiContext, TuiRenderer};
 
 use crate::diff::{DiffOptions, FileComparison};
 use crate::dirdiff::{DirEntryRow, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan};
@@ -1075,23 +1075,30 @@ const TICK: Duration = Duration::from_millis(100);
 /// The session restores the terminal when it is dropped, which covers an early `?` return
 /// and a panic unwinding through here as well as the normal way out.
 pub fn run_app(app: &mut App) -> Result<()> {
-    let mut session = Session::new()?;
+    let mut session: Session = Session::new()?;
     release_mouse()?;
+    // The session keeps the renderer sized from here on; it only has to start out right.
+    let size = session.frame_info().size;
+    let extent = |cells: i32| u16::try_from(cells).unwrap_or(u16::MAX);
+    let config = RendererConfig::new()
+        .columns(extent(size.width))
+        .rows(extent(size.height));
+    let mut context = TuiContext::new(TuiRenderer::new(config));
     let mut frame = Frame::default();
     let mut inputs = [Input::None; 32];
+    let started = Instant::now();
 
     while !app.should_quit {
-        let info = session.frame_info();
-        frame.render(session.platform_mut(), info, |builder: Ui<'_>| {
+        ui::render_frame(&mut frame, &mut context, started.elapsed(), |builder| {
             ui::draw(builder, app);
         });
-        session.present()?;
+        session.present(&mut context)?;
         app.tick();
 
-        let poll = session.poll(Some(TICK), &mut inputs)?;
+        let poll = session.poll(&mut context, Some(TICK), &mut inputs)?;
         if poll.resized {
             // Every cell on screen is stale, not just the ones the next frame changes.
-            session.platform_mut().renderer_mut().invalidate();
+            context.renderer_mut().invalidate();
         }
         for &input in &inputs[..poll.input_count] {
             if let Some(key) = KeyEvent::from_input(input) {
@@ -1099,7 +1106,7 @@ pub fn run_app(app: &mut App) -> Result<()> {
             }
         }
     }
-    session.finish()?;
+    session.finish(&mut context)?;
     Ok(())
 }
 
