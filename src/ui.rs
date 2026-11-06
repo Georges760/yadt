@@ -813,6 +813,7 @@ fn draw_help(root: &mut Root<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
         ("g G", "first / last entry"),
         ("n p", "next / previous difference"),
         ("Enter", "open a diff, or fold a directory"),
+        ("> <", "copy / delete a one-sided file"),
         ("l h / arrows", "expand / collapse"),
         ("f", "cycle filter: all / changes / differing"),
         ("r", "rescan"),
@@ -821,15 +822,6 @@ fn draw_help(root: &mut Root<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
     ];
 
     let help = if dir_mode { DIR_HELP } else { FILE_HELP };
-    let width = 58.min(area.width);
-    let height = (help.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
     let lines: Vec<Vec<(String, Style)>> = help
         .iter()
         .map(|(keys, what)| {
@@ -839,6 +831,29 @@ fn draw_help(root: &mut Root<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
             ]
         })
         .collect();
+
+    // As wide as the longest line, plus the border and a column of margin, so nothing is
+    // cut off whenever the terminal has the room.
+    let widest = lines
+        .iter()
+        .map(|parts| {
+            parts
+                .iter()
+                .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let width = u16::try_from(widest + 3)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let height = (help.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
 
     panel(root, popup, Some(" keys "));
     paragraph(root, popup.inner(), &lines, TextWrap::None);
@@ -1233,8 +1248,16 @@ mod dir_render_tests {
     fn the_help_overlay_shows_directory_keys_in_directory_mode() {
         let mut app = dir_app(sample());
         app.help_visible = true;
-        let joined = frame(&mut app, 60, 18).join("\n");
-        assert!(joined.contains("cycle filter"), "{joined}");
+        let joined = frame(&mut app, 80, 18).join("\n");
+        // In full: the panel is sized to its longest line.
+        assert!(
+            joined.contains("cycle filter: all / changes / differing"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("copy / delete a one-sided file"),
+            "{joined}"
+        );
         assert!(joined.contains("rescan"), "{joined}");
         assert!(!joined.contains("switch focused side"), "{joined}");
     }

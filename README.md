@@ -92,6 +92,7 @@ folded. A directory you fold or unfold by hand stays that way, including across 
 |---|---|
 | `j` `k` / arrows | move selection |
 | `Enter` | open a file diff, or fold a directory |
+| `>` `<` | copy a file present on one side only to the other, or delete it (press twice) |
 | `l` `h` / arrows | expand / collapse |
 | `n` `p` | next / previous difference |
 | `f` | cycle filter: all → changes → differing |

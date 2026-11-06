@@ -679,16 +679,7 @@ pub fn save_atomic(path: &Path, bytes: &[u8], expected: Stamp) -> Result<Stamp, 
         Err(e) => return Err(SaveError::Io(e)),
     }
 
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path.file_name().map_or_else(
-        || std::ffi::OsString::from("yadt"),
-        std::ffi::OsStr::to_os_string,
-    );
-    let mut temp = std::ffi::OsString::from(".");
-    temp.push(&name);
-    temp.push(".yadt-tmp");
-    let temp = dir.join(temp);
-
+    let temp = temp_sibling(path);
     let write = || -> io::Result<()> {
         std::fs::write(&temp, bytes)?;
         // Carry the original mode across; a fresh file would otherwise take the umask.
@@ -705,4 +696,41 @@ pub fn save_atomic(path: &Path, bytes: &[u8], expected: Stamp) -> Result<Stamp, 
             Err(SaveError::Io(e))
         }
     }
+}
+
+/// Copy `from` to `to`, which must not exist yet: a copy never overwrites anything.
+///
+/// Goes through a sibling temporary file for the same reason `save_atomic` does, so an
+/// interrupted copy leaves nothing half-written under the real name. `fs::copy` carries
+/// the permissions across.
+pub fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
+    let temp = temp_sibling(to);
+    let copy = || -> io::Result<()> {
+        std::fs::copy(from, &temp)?;
+        // Check as late as possible, as `save_atomic` does.
+        if to.symlink_metadata().is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "appeared on that side since the scan",
+            ));
+        }
+        std::fs::rename(&temp, to)
+    };
+    copy().inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// A hidden name next to `path`. Being in the same directory is what keeps the final
+/// rename atomic rather than a cross-device copy.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("yadt"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let mut temp = std::ffi::OsString::from(".");
+    temp.push(&name);
+    temp.push(".yadt-tmp");
+    dir.join(temp)
 }

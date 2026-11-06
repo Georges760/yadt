@@ -361,8 +361,9 @@ pub struct DirView {
     /// Directories the user has folded or unfolded by hand. The scan's default never
     /// overrides these, and they outlive a rescan.
     fold_chosen: HashSet<PathBuf>,
-    /// Files compared again after a save from a file view. The scan's roll-up for a
-    /// directory above one of them predates the save, so it is recomputed instead.
+    /// Entries yadt has itself saved, copied or deleted since the scan reported them. The
+    /// scan's roll-up for a directory above one of them is out of date, so it is recomputed
+    /// instead.
     rechecked: HashSet<PathBuf>,
     pub filter: DirFilter,
     /// Index into `visible`, not into `rows`.
@@ -530,10 +531,65 @@ impl DirView {
             *size = std::fs::metadata(path).ok().map(|m| m.len());
         }
 
-        let cursor = self.cursor;
-        let selected = self.visible().get(cursor).copied();
-        self.rechecked.insert(rel.to_path_buf());
+        let selected = self.selected_row();
         self.set_status(i, status);
+        self.settle(rel, selected);
+    }
+
+    /// Copy the file at `rel` from `from`, the one side that has it, to the other side.
+    pub fn copy_entry(&mut self, rel: &Path, from: SideIdx) -> std::io::Result<()> {
+        let Some(&i) = self.index.get(rel) else {
+            return Ok(());
+        };
+        let to = other_side(from);
+        crate::text::copy_new(
+            &self.roots[from.idx()].join(rel),
+            &self.roots[to.idx()].join(rel),
+        )?;
+        let row = &mut self.rows[i];
+        row.present[to.idx()] = true;
+        row.kinds[to.idx()] = Some(EntryKind::File);
+        self.recheck(rel);
+        Ok(())
+    }
+
+    /// Delete the file at `rel` from `side`, the one side that has it, and its row with it.
+    pub fn delete_entry(&mut self, rel: &Path, side: SideIdx) -> std::io::Result<()> {
+        let Some(&i) = self.index.get(rel) else {
+            return Ok(());
+        };
+        std::fs::remove_file(self.roots[side.idx()].join(rel))?;
+
+        // Rows after this one move up by one, the cursor's included.
+        let selected = self
+            .selected_row()
+            .map(|row| if row > i { row - 1 } else { row });
+        let removed = self.rows.remove(i);
+        if removed.status.differs() {
+            self.differing = self.differing.saturating_sub(1);
+        }
+        self.index.remove(rel);
+        for at in self.index.values_mut() {
+            if *at > i {
+                *at -= 1;
+            }
+        }
+        self.dirty = true;
+        self.settle(rel, selected);
+        Ok(())
+    }
+
+    /// The row the cursor is on, as an index into `rows`.
+    fn selected_row(&mut self) -> Option<usize> {
+        let cursor = self.cursor;
+        self.visible().get(cursor).copied()
+    }
+
+    /// Bring the view in line after yadt itself changed `rel` on disk: roll the directories
+    /// above it up again, and put the cursor back on `selected`, a row index, or on the next
+    /// entry if that one is gone or a filter now hides it.
+    fn settle(&mut self, rel: &Path, selected: Option<usize>) {
+        self.rechecked.insert(rel.to_path_buf());
         for dir in rel.ancestors().skip(1) {
             let Some(&d) = self.index.get(dir) else {
                 break;
@@ -544,8 +600,6 @@ impl DirView {
             let rolled = self.rolled_up(d);
             self.set_status(d, rolled);
         }
-
-        // Stay on the same entry, or on the next one if a filter now hides it.
         if let Some(row) = selected {
             self.ensure_visible();
             self.cursor = self.visible.partition_point(|&v| v < row);
@@ -763,6 +817,9 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// A quit was asked for while changes were unsaved, and is waiting to be confirmed.
     pub quit_confirm: bool,
+    /// A delete asked for in the directory view, waiting for the same key again: the entry,
+    /// and the side it would be deleted from.
+    pub delete_confirm: Option<(PathBuf, SideIdx)>,
     pub opts: Options,
     pub theme: Theme,
     pub help_visible: bool,
@@ -804,6 +861,7 @@ impl App {
             theme,
             prompt: None,
             quit_confirm: false,
+            delete_confirm: None,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -942,6 +1000,11 @@ impl App {
         );
         if !repeat {
             self.quit_confirm = false;
+        }
+        // The same goes for a delete. `sync_selected` takes it, so only the very next
+        // `>` or `<`, on the same entry and in the same direction, can confirm it.
+        if !matches!(key.code, KeyCode::Char('>' | '<')) {
+            self.delete_confirm = None;
         }
 
         // While a prompt is open it owns the keyboard, so a query can contain q, j, or
@@ -1116,9 +1179,11 @@ impl App {
     }
 
     fn handle_dir_key(&mut self, key: KeyEvent, ctrl: bool) {
-        if key.code == KeyCode::Enter {
-            self.open_selected();
-            return;
+        match key.code {
+            KeyCode::Enter => return self.open_selected(),
+            KeyCode::Char('>') => return self.sync_selected(SideIdx::LEFT),
+            KeyCode::Char('<') => return self.sync_selected(SideIdx::RIGHT),
+            _ => {}
         }
         if key.code == KeyCode::Char('r') {
             let follow = self.opts.follow_symlinks;
@@ -1151,6 +1216,64 @@ impl App {
             KeyCode::Char('f') => view.cycle_filter(),
             _ => {}
         }
+    }
+}
+
+impl App {
+    /// `>` or `<` on a file that is on one side only: make the side the arrow points at
+    /// match the side it points from. That copies the file across, or, when the arrow points
+    /// at the side holding it, deletes it there, which takes a second press of the same key.
+    fn sync_selected(&mut self, from: SideIdx) {
+        let pending = self.delete_confirm.take();
+        let Some(dir) = self.active_dir() else {
+            return;
+        };
+        let Some(row) = dir.selected() else {
+            return;
+        };
+        let (rel, name) = (row.rel.clone(), row.name());
+        let EntryStatus::OnlyIn(side) = row.status else {
+            self.status = "> and < copy or delete a file that is on one side only".to_string();
+            return;
+        };
+        if row.kind_on(side) != Some(EntryKind::File) {
+            self.status = "only a file can be copied or deleted".to_string();
+            return;
+        }
+
+        let outcome = if side == from {
+            let to = side_name(other_side(from));
+            dir.copy_entry(&rel, from)
+                .map(|()| format!("copied {name} to the {to}"))
+        } else if pending.as_ref() == Some(&(rel.clone(), side)) {
+            dir.delete_entry(&rel, side)
+                .map(|()| format!("deleted {name} from the {}", side_name(side)))
+        } else {
+            let key = if from == SideIdx::LEFT { '>' } else { '<' };
+            self.status = format!(
+                "press {key} again to delete {name} from the {}",
+                side_name(side)
+            );
+            self.delete_confirm = Some((rel, side));
+            return;
+        };
+        self.status = outcome.unwrap_or_else(|e| format!("{}: {e}", rel.display()));
+    }
+}
+
+fn other_side(side: SideIdx) -> SideIdx {
+    if side == SideIdx::LEFT {
+        SideIdx::RIGHT
+    } else {
+        SideIdx::LEFT
+    }
+}
+
+fn side_name(side: SideIdx) -> &'static str {
+    if side == SideIdx::LEFT {
+        "left"
+    } else {
+        "right"
     }
 }
 
@@ -1845,6 +1968,7 @@ mod search_view_tests {
             theme: Theme::no_color(),
             prompt: None,
             quit_confirm: false,
+            delete_confirm: None,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -2059,6 +2183,7 @@ mod hex_view_tests {
             theme: Theme::no_color(),
             prompt: None,
             quit_confirm: false,
+            delete_confirm: None,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -2723,6 +2848,7 @@ mod edit_view_tests {
             theme: Theme::no_color(),
             prompt: None,
             quit_confirm: false,
+            delete_confirm: None,
             help_visible: false,
             status: String::new(),
             should_quit: false,
@@ -2768,27 +2894,7 @@ mod edit_view_tests {
             std::fs::write(root.join("sub/f.txt"), body).unwrap();
             std::fs::write(root.join("sub/g.txt"), "same\n").unwrap();
         }
-        let mut dir = DirView::new(l, r.clone(), false);
-        dir.wait_for_scan();
-        let mut app = App {
-            views: vec![View::Dir(Box::new(dir))],
-            opts: Options {
-                diff: DiffOptions::default(),
-                tab_width: 8,
-                max_file_size: u64::MAX,
-                follow_symlinks: false,
-                context: None,
-                hex_width_pinned: false,
-            },
-            theme: Theme::no_color(),
-            prompt: None,
-            quit_confirm: false,
-            help_visible: false,
-            status: String::new(),
-            should_quit: false,
-            exit_code: crate::exit::DIFFERENT,
-        };
-        let press = |app: &mut App, code: KeyCode| app.handle_key(KeyEvent::new(code));
+        let mut app = dir_app(&l, &r);
 
         app.active_dir().unwrap().cursor = 1;
         let opened = app.active_dir().unwrap().selected().unwrap().rel.clone();
@@ -2819,6 +2925,159 @@ mod edit_view_tests {
         assert_eq!(dir.differing, 0);
         app.tick();
         assert_eq!(app.exit_code(), crate::exit::IDENTICAL);
+    }
+
+    /// An app on the directory comparison of `l` and `r`, scanned to the end.
+    fn dir_app(l: &Path, r: &Path) -> App {
+        let mut dir = DirView::new(l.to_path_buf(), r.to_path_buf(), false);
+        dir.wait_for_scan();
+        App {
+            views: vec![View::Dir(Box::new(dir))],
+            opts: Options {
+                diff: DiffOptions::default(),
+                tab_width: 8,
+                max_file_size: u64::MAX,
+                follow_symlinks: false,
+                context: None,
+                hex_width_pinned: false,
+            },
+            theme: Theme::no_color(),
+            prompt: None,
+            quit_confirm: false,
+            delete_confirm: None,
+            help_visible: false,
+            status: String::new(),
+            should_quit: false,
+            exit_code: crate::exit::DIFFERENT,
+        }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code));
+    }
+
+    /// Put the directory view's cursor on `rel`.
+    fn select(app: &mut App, rel: &str) {
+        let dir = app.active_dir().unwrap();
+        let visible = dir.visible().to_vec();
+        dir.cursor = visible
+            .iter()
+            .position(|&i| dir.rows[i].rel == Path::new(rel))
+            .unwrap_or_else(|| panic!("{rel} is not visible"));
+    }
+
+    /// `l` and `r` under `s`: `a.txt` only on the left inside `sub`, `b.txt` differing,
+    /// `z.txt` only on the right, and `only/` a directory on the left alone.
+    fn one_sided_trees(s: &Scratch) -> (PathBuf, PathBuf) {
+        let (l, r) = (s.0.join("l"), s.0.join("r"));
+        for root in [&l, &r] {
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+        }
+        std::fs::create_dir_all(l.join("only")).unwrap();
+        std::fs::write(l.join("sub/a.txt"), "alpha\n").unwrap();
+        std::fs::write(l.join("b.txt"), "1\n").unwrap();
+        std::fs::write(r.join("b.txt"), "2\n").unwrap();
+        std::fs::write(r.join("z.txt"), "zed\n").unwrap();
+        (l, r)
+    }
+
+    #[test]
+    fn copying_a_one_sided_file_across_makes_its_directory_identical() {
+        let s = Scratch::new("dir-copy");
+        let (l, r) = one_sided_trees(&s);
+        let mut app = dir_app(&l, &r);
+        let before = app.active_dir().unwrap().differing;
+
+        select(&mut app, "sub/a.txt");
+        press(&mut app, KeyCode::Char('>'));
+
+        assert_eq!(app.status, "copied a.txt to the right");
+        assert_eq!(
+            std::fs::read_to_string(r.join("sub/a.txt")).unwrap(),
+            "alpha\n"
+        );
+        let dir = app.active_dir().unwrap();
+        let row = dir.selected().unwrap();
+        assert_eq!(row.rel, Path::new("sub/a.txt"));
+        assert_eq!(row.status, EntryStatus::Identical);
+        assert_eq!(row.present[..2], [true, true]);
+        let sub = dir.rows.iter().find(|row| row.rel == Path::new("sub"));
+        assert_eq!(sub.unwrap().status, EntryStatus::Identical);
+        assert_eq!(dir.differing, before - 2, "the file and its directory");
+    }
+
+    #[test]
+    fn deleting_a_one_sided_file_takes_a_second_press() {
+        let s = Scratch::new("dir-delete");
+        let (l, r) = one_sided_trees(&s);
+        let mut app = dir_app(&l, &r);
+        let before = app.active_dir().unwrap().differing;
+
+        // `<` makes the left match the right, which does not have it.
+        select(&mut app, "sub/a.txt");
+        press(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.status, "press < again to delete a.txt from the left");
+        assert!(l.join("sub/a.txt").exists(), "one press must not delete");
+
+        press(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.status, "deleted a.txt from the left");
+        assert!(!l.join("sub/a.txt").exists());
+        let dir = app.active_dir().unwrap();
+        assert!(dir.rows.iter().all(|row| row.rel != Path::new("sub/a.txt")));
+        assert_eq!(dir.differing, before - 2, "the file and its directory");
+        // The cursor lands on what came next.
+        assert_eq!(dir.selected().unwrap().rel, Path::new("z.txt"));
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_pending_delete() {
+        let s = Scratch::new("dir-delete-cancel");
+        let (l, r) = one_sided_trees(&s);
+        let mut app = dir_app(&l, &r);
+
+        select(&mut app, "z.txt");
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('>'));
+        assert!(r.join("z.txt").exists(), "the confirmation went stale");
+        assert_eq!(app.status, "press > again to delete z.txt from the right");
+
+        // The opposite key is not a confirmation either: it copies the other way.
+        press(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.status, "copied z.txt to the left");
+        assert!(r.join("z.txt").exists());
+    }
+
+    #[test]
+    fn only_a_one_sided_file_can_be_copied_or_deleted() {
+        let s = Scratch::new("dir-sync-refused");
+        let (l, r) = one_sided_trees(&s);
+        let mut app = dir_app(&l, &r);
+
+        select(&mut app, "b.txt");
+        press(&mut app, KeyCode::Char('>'));
+        assert_eq!(
+            app.status,
+            "> and < copy or delete a file that is on one side only"
+        );
+        assert_eq!(std::fs::read_to_string(r.join("b.txt")).unwrap(), "2\n");
+
+        select(&mut app, "only");
+        press(&mut app, KeyCode::Char('>'));
+        assert_eq!(app.status, "only a file can be copied or deleted");
+        assert!(!r.join("only").exists());
+    }
+
+    #[test]
+    fn a_copy_never_overwrites() {
+        let s = Scratch::new("copy-new");
+        let (from, to) = (s.file("from", "new"), s.file("to", "old"));
+        let err = crate::text::copy_new(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "old");
+        let leftovers = std::fs::read_dir(&s.0).unwrap().count();
+        assert_eq!(leftovers, 2, "the temporary file should be gone");
     }
 }
 
@@ -2875,6 +3134,7 @@ mod quit_guard_tests {
             theme: Theme::no_color(),
             prompt: None,
             quit_confirm: false,
+            delete_confirm: None,
             help_visible: false,
             status: String::new(),
             should_quit: false,
