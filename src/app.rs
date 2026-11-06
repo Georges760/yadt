@@ -13,7 +13,9 @@ use blit::{Frame, Input};
 use blit_tui::{RendererConfig, Session, TuiContext, TuiRenderer};
 
 use crate::diff::{DiffOptions, FileComparison};
-use crate::dirdiff::{DirEntryRow, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan};
+use crate::dirdiff::{
+    DirEntryRow, EntryKind, EntryStatus, FsSource, ScanEvent, ScanHandle, spawn_scan,
+};
 use crate::edit::{self, Edit};
 use crate::key::{KeyCode, KeyEvent};
 use crate::model::{self, SideIdx, ViewRow};
@@ -89,6 +91,9 @@ pub struct FileView {
     pub focus: SideIdx,
     /// Viewport height, recorded during draw so paging can use it.
     pub viewport: u16,
+    /// The directory entry this diff was opened from, relative to the directory view's
+    /// roots, so that a save can be reflected there. `None` for a diff opened directly.
+    pub entry: Option<PathBuf>,
 }
 
 impl FileView {
@@ -119,6 +124,7 @@ impl FileView {
             // screen where the diff has not loaded yet.
             notice: !cmp_differs && !cmp_failed,
             hex_pinned: false,
+            entry: None,
         };
         view.rebuild_rows();
         view
@@ -355,6 +361,9 @@ pub struct DirView {
     /// Directories the user has folded or unfolded by hand. The scan's default never
     /// overrides these, and they outlive a rescan.
     fold_chosen: HashSet<PathBuf>,
+    /// Files compared again after a save from a file view. The scan's roll-up for a
+    /// directory above one of them predates the save, so it is recomputed instead.
+    rechecked: HashSet<PathBuf>,
     pub filter: DirFilter,
     /// Index into `visible`, not into `rows`.
     pub cursor: usize,
@@ -377,6 +386,7 @@ impl DirView {
             index: HashMap::new(),
             collapsed: HashSet::new(),
             fold_chosen: HashSet::new(),
+            rechecked: HashSet::new(),
             filter: DirFilter::All,
             cursor: 0,
             top: 0,
@@ -404,6 +414,7 @@ impl DirView {
         self.scan = None;
         self.rows.clear();
         self.index.clear();
+        self.rechecked.clear();
         self.errors.clear();
         self.scanned = 0;
         self.differing = 0;
@@ -447,19 +458,15 @@ impl DirView {
             }
             ScanEvent::Update { rel, status } => {
                 if let Some(&i) = self.index.get(&rel) {
-                    let was = self.rows[i].status;
-                    if was.differs() != status.differs() {
-                        if status.differs() {
-                            self.differing += 1;
-                        } else {
-                            self.differing = self.differing.saturating_sub(1);
-                        }
-                    }
-                    self.rows[i].status = status;
+                    let status = if self.rechecked.iter().any(|r| r.starts_with(&rel)) {
+                        self.rolled_up(i)
+                    } else {
+                        status
+                    };
+                    self.set_status(i, status);
                     if status.differs() {
                         self.reveal(&rel);
                     }
-                    self.dirty = true;
                 }
             }
             ScanEvent::Progress { entries } => self.scanned = entries.max(self.scanned),
@@ -468,6 +475,80 @@ impl DirView {
                 self.done = true;
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Change an entry's status, keeping the differing count in step with it.
+    fn set_status(&mut self, i: usize, status: EntryStatus) {
+        let was = self.rows[i].status;
+        if was.differs() != status.differs() {
+            if status.differs() {
+                self.differing += 1;
+            } else {
+                self.differing = self.differing.saturating_sub(1);
+            }
+        }
+        self.rows[i].status = status;
+        self.dirty = true;
+    }
+
+    /// A finished directory's status, read off the entries below it. They follow it
+    /// directly in `rows`, the walk being depth-first.
+    fn rolled_up(&self, dir: usize) -> EntryStatus {
+        let depth = self.rows[dir].depth;
+        let differs = self.rows[dir + 1..]
+            .iter()
+            .take_while(|r| r.depth > depth)
+            .any(|r| r.status.differs());
+        if differs {
+            EntryStatus::Differing
+        } else {
+            EntryStatus::Identical
+        }
+    }
+
+    /// Compare the file at `rel` again, because a file view has just written to it.
+    ///
+    /// Only that file is read. The directories above it are recomputed from their entries,
+    /// which is exact: a file can only be opened when both sides listed its directory, so
+    /// no listing error is hiding behind their status. One the scan has not finished stays
+    /// pending, and `rechecked` corrects its roll-up when it arrives.
+    pub fn recheck(&mut self, rel: &Path) {
+        let Some(&i) = self.index.get(rel) else {
+            return;
+        };
+        if self.rows[i].kind != EntryKind::File {
+            return;
+        }
+        let paths = self.roots.clone().map(|root| root.join(rel));
+        let status = match crate::text::files_equal(&paths[0], &paths[1]) {
+            Ok(true) => EntryStatus::Identical,
+            Ok(false) => EntryStatus::Differing,
+            Err(e) => EntryStatus::Unreadable(e.kind()),
+        };
+        for (size, path) in self.rows[i].sizes.iter_mut().zip(&paths) {
+            *size = std::fs::metadata(path).ok().map(|m| m.len());
+        }
+
+        let cursor = self.cursor;
+        let selected = self.visible().get(cursor).copied();
+        self.rechecked.insert(rel.to_path_buf());
+        self.set_status(i, status);
+        for dir in rel.ancestors().skip(1) {
+            let Some(&d) = self.index.get(dir) else {
+                break;
+            };
+            if self.rows[d].status == EntryStatus::Pending {
+                break;
+            }
+            let rolled = self.rolled_up(d);
+            self.set_status(d, rolled);
+        }
+
+        // Stay on the same entry, or on the next one if a filter now hides it.
+        if let Some(row) = selected {
+            self.ensure_visible();
+            self.cursor = self.visible.partition_point(|&v| v < row);
         }
     }
 
@@ -796,6 +877,18 @@ impl App {
         }
     }
 
+    /// Bring the directory view beneath the active file view up to date with what was just
+    /// saved, so it is already right when the file view is popped.
+    fn recheck_entry(&mut self, rel: &Path) {
+        let dir = self.views.iter_mut().rev().find_map(|view| match view {
+            View::Dir(dir) => Some(dir),
+            View::File(_) => None,
+        });
+        if let Some(dir) = dir {
+            dir.recheck(rel);
+        }
+    }
+
     /// Open the selected directory entry: a directory expands, a file opens a diff.
     fn open_selected(&mut self) {
         let (max_size, diff_opts, context) =
@@ -806,7 +899,7 @@ impl App {
         let Some(row) = dir.selected() else {
             return;
         };
-        let (status, is_dir) = (row.status, row.kind.is_dir());
+        let (status, is_dir, rel) = (row.status, row.kind.is_dir(), row.rel.clone());
 
         if is_dir {
             dir.toggle_expand();
@@ -827,6 +920,7 @@ impl App {
         self.status.clear();
         let mut view = FileView::configured(cmp, context, diff_opts);
         view.hex_pinned = self.opts.hex_width_pinned;
+        view.entry = Some(rel);
         self.views.push(View::File(Box::new(view)));
     }
 
@@ -998,9 +1092,14 @@ impl App {
                 self.status = report(outcome);
             }
             KeyCode::Char('s') => {
+                // Even a failed save may have written one side before it stopped.
+                let entry = view.entry.clone().filter(|_| view.is_dirty());
                 self.status = match view.save() {
                     Ok(message) | Err(message) => message,
                 };
+                if let Some(rel) = entry {
+                    self.recheck_entry(&rel);
+                }
             }
             KeyCode::Char('N') => view.step_match(true),
             KeyCode::Char('P') => view.step_match(false),
@@ -1148,6 +1247,7 @@ mod tests {
             index: HashMap::new(),
             collapsed: HashSet::new(),
             fold_chosen: HashSet::new(),
+            rechecked: HashSet::new(),
             filter: DirFilter::All,
             cursor: 0,
             top: 0,
@@ -1450,6 +1550,60 @@ mod tests {
             shown,
             ["changed", "changed/inner", "changed/inner/b", "same"]
         );
+    }
+
+    /// Two trees on disk holding `files`, each as (relative path, left body, right body).
+    /// Returns the directory to remove afterwards and the two roots.
+    fn trees(name: &str, files: &[(&str, &str, &str)]) -> (PathBuf, [PathBuf; 2]) {
+        let base = std::env::temp_dir().join(format!("yadt-{name}-{}", std::process::id()));
+        let roots = [base.join("l"), base.join("r")];
+        for (rel, left, right) in files {
+            for (root, body) in roots.iter().zip([left, right]) {
+                let path = root.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, body).unwrap();
+            }
+        }
+        (base, roots)
+    }
+
+    #[test]
+    fn a_roll_up_from_before_a_recheck_is_recomputed_when_it_arrives() {
+        // The scan saw sub/f differ; it has been saved identical since.
+        let (base, roots) = trees("stale-roll-up", &[("sub/f", "same", "same")]);
+        let mut v = view(vec![]);
+        v.roots = roots;
+        entry(&mut v, "sub", EntryKind::Dir, EntryStatus::Pending);
+        entry(&mut v, "sub/f", EntryKind::File, EntryStatus::Differing);
+        assert_eq!(v.differing, 1);
+
+        v.recheck(Path::new("sub/f"));
+        let f = v.index[Path::new("sub/f")];
+        assert_eq!(v.rows[f].status, EntryStatus::Identical);
+        assert_eq!(v.differing, 0);
+        let sub = v.index[Path::new("sub")];
+        assert_eq!(v.rows[sub].status, EntryStatus::Pending, "the scan owns it");
+
+        roll_up(&mut v, "sub", EntryStatus::Differing);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(v.rows[sub].status, EntryStatus::Identical);
+        assert_eq!(v.differing, 0);
+    }
+
+    #[test]
+    fn a_rechecked_entry_the_filter_now_hides_hands_the_cursor_to_the_next() {
+        let (base, roots) = trees("recheck-filter", &[("a", "x", "x"), ("b", "1", "2")]);
+        let mut v = view(vec![]);
+        v.roots = roots;
+        v.filter = DirFilter::DifferingOnly;
+        entry(&mut v, "a", EntryKind::File, EntryStatus::Differing);
+        entry(&mut v, "b", EntryKind::File, EntryStatus::Differing);
+        v.cursor = 0;
+
+        v.recheck(Path::new("a"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(names(&mut v), ["b"]);
+        assert_eq!(v.selected().unwrap().rel, PathBuf::from("b"));
     }
 
     #[test]
@@ -2603,6 +2757,68 @@ mod edit_view_tests {
         press(&mut app, 's');
         assert!(app.status.contains("saved"), "status was {:?}", app.status);
         assert_eq!(std::fs::read_to_string(&r).unwrap(), "a\nLEFT\nb\n");
+    }
+
+    #[test]
+    fn saving_a_diff_opened_from_a_directory_updates_the_directory_view() {
+        let s = Scratch::new("dir-save");
+        let (l, r) = (s.0.join("l"), s.0.join("r"));
+        for (root, body) in [(&l, "a\nLEFT\nb\n"), (&r, "a\nright\nb\n")] {
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            std::fs::write(root.join("sub/f.txt"), body).unwrap();
+            std::fs::write(root.join("sub/g.txt"), "same\n").unwrap();
+        }
+        let mut dir = DirView::new(l, r.clone(), false);
+        dir.wait_for_scan();
+        let mut app = App {
+            views: vec![View::Dir(Box::new(dir))],
+            opts: Options {
+                diff: DiffOptions::default(),
+                tab_width: 8,
+                max_file_size: u64::MAX,
+                follow_symlinks: false,
+                context: None,
+                hex_width_pinned: false,
+            },
+            theme: Theme::no_color(),
+            prompt: None,
+            quit_confirm: false,
+            help_visible: false,
+            status: String::new(),
+            should_quit: false,
+            exit_code: crate::exit::DIFFERENT,
+        };
+        let press = |app: &mut App, code: KeyCode| app.handle_key(KeyEvent::new(code));
+
+        app.active_dir().unwrap().cursor = 1;
+        let opened = app.active_dir().unwrap().selected().unwrap().rel.clone();
+        assert_eq!(opened, Path::new("sub/f.txt"));
+        press(&mut app, KeyCode::Enter);
+        on_first_hunk(app.active_file().unwrap());
+        press(&mut app, KeyCode::Char('>'));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(
+            std::fs::read_to_string(r.join("sub/f.txt")).unwrap(),
+            "a\nLEFT\nb\n"
+        );
+        let dir = app
+            .active_dir()
+            .expect("Esc should go back to the directory");
+        let row = dir.selected().unwrap();
+        assert_eq!(row.rel, opened, "the selection should not move");
+        assert_eq!(row.sizes[0], row.sizes[1], "sizes are read again too");
+        assert!(
+            dir.rows
+                .iter()
+                .all(|row| row.status == EntryStatus::Identical),
+            "{:?}",
+            dir.rows.iter().map(|row| row.status).collect::<Vec<_>>()
+        );
+        assert_eq!(dir.differing, 0);
+        app.tick();
+        assert_eq!(app.exit_code(), crate::exit::IDENTICAL);
     }
 }
 
