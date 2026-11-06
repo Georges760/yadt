@@ -698,27 +698,87 @@ pub fn save_atomic(path: &Path, bytes: &[u8], expected: Stamp) -> Result<Stamp, 
     }
 }
 
-/// Copy `from` to `to`, which must not exist yet: a copy never overwrites anything.
+/// Copy the file or directory at `from` to `to`, which must not exist yet: this never
+/// overwrites anything.
 ///
-/// Goes through a sibling temporary file for the same reason `save_atomic` does, so an
-/// interrupted copy leaves nothing half-written under the real name. `fs::copy` carries
-/// the permissions across.
+/// A directory is copied whole, with the symlinks inside it copied as links rather than
+/// followed. Permissions come across.
 pub fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
+    place(to, false, |temp| copy_into(from, temp))
+}
+
+/// Replace the file at `to` with a copy of the file at `from`.
+pub fn copy_over(from: &Path, to: &Path) -> io::Result<()> {
+    place(to, true, |temp| std::fs::copy(from, temp).map(drop))
+}
+
+/// Have `build` make the new entry under a hidden sibling name, then rename it to `to`.
+///
+/// The same reasoning as `save_atomic`: an interrupted copy leaves nothing half-written
+/// under the real name. Unless `replace` is set, `to` must not exist, which is checked as
+/// late as possible.
+fn place(to: &Path, replace: bool, build: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
     let temp = temp_sibling(to);
-    let copy = || -> io::Result<()> {
-        std::fs::copy(from, &temp)?;
-        // Check as late as possible, as `save_atomic` does.
-        if to.symlink_metadata().is_ok() {
+    // Not ours to clean up: it may be what is left of an interrupted copy, or anything.
+    if temp.symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is in the way", temp.display()),
+        ));
+    }
+    let result = build(&temp).and_then(|()| {
+        if !replace && to.symlink_metadata().is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "appeared on that side since the scan",
             ));
         }
         std::fs::rename(&temp, to)
-    };
-    copy().inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })
+    });
+    if result.is_err() {
+        let _ = match temp.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&temp),
+            _ => std::fs::remove_file(&temp),
+        };
+    }
+    result
+}
+
+/// Copy whatever is at `from` to `to`, recursively, without following symlinks.
+fn copy_into(from: &Path, to: &Path) -> io::Result<()> {
+    let meta = from.symlink_metadata()?;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        symlink(&std::fs::read_link(from)?, to)
+    } else if kind.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_into(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        // Last, so a read-only directory can still be filled first.
+        std::fs::set_permissions(to, meta.permissions())
+    } else if kind.is_file() {
+        std::fs::copy(from, to).map(drop)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{}: not a file, directory or symlink", from.display()),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn symlink(_: &Path, link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{}: cannot copy a symlink here", link.display()),
+    ))
 }
 
 /// A hidden name next to `path`. Being in the same directory is what keeps the final

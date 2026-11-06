@@ -813,7 +813,7 @@ fn draw_help(root: &mut Root<'_>, area: Rect, theme: &Theme, dir_mode: bool) {
         ("g G", "first / last entry"),
         ("n p", "next / previous difference"),
         ("Enter", "open a diff, or fold a directory"),
-        ("> <", "copy / delete a one-sided file"),
+        ("> <", "copy across, or delete a one-sided file"),
         ("l h / arrows", "expand / collapse"),
         ("f", "cycle filter: all / changes / differing"),
         ("r", "rescan"),
@@ -1255,7 +1255,7 @@ mod dir_render_tests {
             "{joined}"
         );
         assert!(
-            joined.contains("copy / delete a one-sided file"),
+            joined.contains("copy across, or delete a one-sided file"),
             "{joined}"
         );
         assert!(joined.contains("rescan"), "{joined}");
